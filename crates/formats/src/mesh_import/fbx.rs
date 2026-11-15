@@ -1,7 +1,7 @@
 //! FBX 6.x and 7.x, binary (32- and 64-bit node records, zlib-compressed arrays) and
-//! ASCII: mesh geometry with normals, UVs and per-polygon materials from the layer elements, every
-//! Model's transform and parent hierarchy, and the file's unit and axis system (converted to
-//! meters, Y up, like glTF). FBX 6 keeps the geometry inside its Model, names objects instead of
+//! ASCII: mesh geometry with normals, UVs, vertex colors and per-polygon materials from the layer
+//! elements, every Model's transform and parent hierarchy, and the file's unit and axis system
+//! (converted to meters, Y up, like glTF). FBX 6 keeps the geometry inside its Model, names objects instead of
 //! numbering them and lists properties in `Properties60`; both read into the same scene.
 //! Materials bring their diffuse color and, when the file embeds it (a Video's `Content`), the
 //! diffuse texture (for high-poly color map bakes); a texture kept as a file beside the FBX comes
@@ -803,9 +803,10 @@ fn add_geometry(sink: &mut PolygonSink, geometry: &Node, transform: Mat4, slots:
     let polygon_indices = geometry.child("PolygonVertexIndex").map(Node::arr).unwrap_or_default();
     let normals = Layer::read(geometry, "LayerElementNormal", "Normals", "NormalsIndex");
     let uvs = Layer::read(geometry, "LayerElementUV", "UV", "UVIndex");
+    let colors = Layer::read(geometry, "LayerElementColor", "Colors", "ColorIndex");
     let materials = Layer::read(geometry, "LayerElementMaterial", "Materials", "");
     if vertices.iter().chain(polygon_indices.iter()).any(|v| !v.is_finite())
-        || [&normals, &uvs, &materials]
+        || [&normals, &uvs, &colors, &materials]
             .into_iter()
             .flatten()
             .any(|layer| layer.data.iter().any(|v| !v.is_finite()) || layer.index.as_ref().is_some_and(|index| index.iter().any(|v| !v.is_finite())))
@@ -838,7 +839,10 @@ fn add_geometry(sink: &mut PolygonSink, geometry: &Node, transform: Mat4, slots:
                 Vec2::ZERO
             }
         });
-        corners.push(Corner { p: *p, n, uv });
+        // FBX color layers hold one RGBA value per item.
+        let color =
+            colors.as_ref().and_then(|l| l.get::<4>(k, control_point, polygon_index)).map(|[r, g, b, a]| Vec4::new(r as f32, g as f32, b as f32, a as f32));
+        corners.push(Corner { p: *p, n, uv, color });
         if last || k + 1 == polygon_indices.len() {
             if flip {
                 corners.reverse();
