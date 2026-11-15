@@ -222,9 +222,10 @@ pub(crate) fn targets_content(app: &TextureCraftApp) -> bool {
     }
 }
 
-/// "Add effect" items for `layer`: content when it is the selected target, else the mask
-fn effect_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
-    let content = !layer.is_group() && app.session.selected_layer() == Some(layer.id) && targets_content(app);
+/// "Add effect" items for `layer`: its mask when `to_mask`, else the selected target (the layer
+/// content when that is selected, the mask otherwise)
+fn effect_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, to_mask: bool) {
+    let content = !to_mask && !layer.is_group() && app.session.selected_layer() == Some(layer.id) && targets_content(app);
     let target = if content { "content" } else { "mask" };
     ui.label(caption(if content { tr("Add to the layer content") } else { tr("Add to the mask") }));
 
@@ -239,12 +240,20 @@ fn effect_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         (tr("Add anchor point"), "effect.add.anchor", json!({})),
     ];
     for (label, command, params) in items {
+        // An anchor point records the content below it, so it has no place in a mask menu.
+        if to_mask && command == "effect.add.anchor" {
+            continue;
+        }
+
         let enabled = command != "effect.add.anchor" || !layer.is_group();
         if !ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
             continue;
         }
 
-        if app.session.selected_layer() != Some(layer.id) {
+        // A mask menu acts on the mask even when the content (or an effect of it) is selected.
+        if to_mask {
+            app.run("layer.select", json!({"layer": layer.id.0, "target": "mask"}));
+        } else if app.session.selected_layer() != Some(layer.id) {
             app.run("layer.select", json!({"layer": layer.id.0}));
         }
 
@@ -483,6 +492,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
                 app.run("viewport.view", p);
             }
         }
+        mr.context_menu(|ui| effect_menu(app, ui, layer, true));
         if app.session.view == texturecraft_engine::ViewMode::Mask(layer.id) {
             p.rect_stroke(mask_rect.expand(2.0), 2.0, Stroke::new(1.5, tk.warning), egui::StrokeKind::Outside);
         }
@@ -934,7 +944,7 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         }
     });
     ui.separator();
-    effect_menu(app, ui, layer);
+    effect_menu(app, ui, layer, false);
 }
 
 // ---------------------------------------------------------------------------------------------
