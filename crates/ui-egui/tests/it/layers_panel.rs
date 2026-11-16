@@ -148,5 +148,7 @@ fn the_mask_thumbnail_menu_adds_effects_to_the_mask() {
     let mask = layer.mask.as_ref().expect("the layer keeps its mask");
     assert_eq!(mask.effects.len(), 2, "the mask menu adds a fill beside the pre-existing mask effect");
     assert_eq!(layer.content_effects.len(), 1, "the content effects are untouched");
-    assert_eq!(h.state().session.target, StackTarget::Mask, "and the mask stays selected");
+    // effect.add.* selects the effect it adds, on the mask like in the content stack.
+    let added = mask.effects.last().map(|e| e.id).expect("the mask menu adds an effect");
+    assert_eq!(h.state().session.target, StackTarget::Effect(added), "the new mask effect is selected");
 }
