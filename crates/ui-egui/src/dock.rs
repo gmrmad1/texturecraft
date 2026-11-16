@@ -154,7 +154,7 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
         let selected = app.session.selected_layer().and_then(|id| app.session.doc.project.layers.get(&id)).cloned();
         ui.menu_button(RichText::new(ic::MAGIC_WAND).size(14.0), |ui| match &selected {
-            Some(l) => effect_menu(app, ui, l),
+            Some(l) => effect_menu(app, ui, l, false),
             None => {
                 ui.label(RichText::new(tr("Select a layer")).color(tk.text_dim));
             }
