@@ -126,7 +126,6 @@ mod tests {
         let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
         h.state_mut().updates_rt.updater =
             Updater::new(&crate::UPDATE_APP, "0.0.1").with_source(ask).with_paths(Paths::under(&root)).with_pins_path(root.join("pins.json"));
-        h.state_mut().ui.windows.start = false;
         h.run_steps(2);
         h
     }
@@ -200,13 +199,13 @@ mod tests {
         assert_eq!(h.state().ui.mode, Mode::Painting);
         offer(&mut h);
         assert!(crate::docking::input_blocked(h.state(), &h.ctx), "floating panels stop taking input");
-        h.key_press(egui::Key::F8);
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::B);
         h.step();
         assert_eq!(h.state().ui.mode, Mode::Painting, "the prompt holds the keyboard");
         h.get_by_label("LATER").click();
         h.run_steps(2);
         assert!(!crate::docking::input_blocked(h.state(), &h.ctx));
-        h.key_press(egui::Key::F8);
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::B);
         h.step();
         assert_eq!(h.state().ui.mode, Mode::Baking, "the key works once the prompt is closed");
     }
@@ -263,7 +262,7 @@ mod tests {
         assert!(!safe_to_close(h.state()), "unsaved changes");
         h.state_mut().session.modified = false;
 
-        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0 });
+        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0, mesh_id: 0 });
         assert!(!safe_to_close(h.state()), "a bake");
         h.state_mut().bake = None;
 
