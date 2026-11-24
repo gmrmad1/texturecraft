@@ -1012,3 +1012,12 @@ fn layer_list_rejects_an_unknown_texture_set() {
     let stack = execute(&mut s, "layer.list", &json!({"ts": 0})).unwrap();
     assert!(stack.as_array().is_some_and(|layers| !layers.is_empty()), "the real stack still lists: {stack}");
 }
+
+#[test]
+fn layer_list_rejects_a_negative_texture_set() {
+    let mut s = session();
+
+    assert!(execute(&mut s, "layer.list", &json!({"ts": -1})).is_err(), "a negative set index is an error, not the active set");
+    let stack = execute(&mut s, "layer.list", &Value::Null).unwrap();
+    assert!(stack.as_array().is_some_and(|layers| !layers.is_empty()), "without `ts` the active stack still lists: {stack}");
+}
