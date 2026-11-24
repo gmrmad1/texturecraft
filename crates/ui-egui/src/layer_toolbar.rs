@@ -373,7 +373,7 @@ fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>, force_mask: bool) 
     let anywhere = layer.is_some();
     let mask_only = anywhere && !content;
     let item = |icon, short, long, command, params: Value, enabled| AddItem { icon: ItemIcon::Glyph(icon), short, long, command, params, enabled };
-    vec![
+    let mut items = vec![
         item(ic::SPARKLE, n_("Generator"), n_("Add generator"), "effect.add.generator", json!({}), mask_only),
         item(ic::PAINT_BRUSH, n_("Paint"), n_("Add paint"), "effect.add.paint", json!({"target": target}), anywhere),
         item(ic::PAINT_BUCKET, n_("Fill"), n_("Add fill"), "effect.add.fill", json!({"target": target}), anywhere),
@@ -381,8 +381,12 @@ fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>, force_mask: bool) 
         item(ic::SCALES, n_("Compare mask"), n_("Add compare mask"), "effect.add.compare", json!({}), mask_only),
         item(ic::FUNNEL, n_("Filter"), n_("Add filter"), "effect.add.filter", json!({"target": target, "filter": NEW_FILTER}), anywhere),
         item(ic::SELECTION, n_("Color selection"), n_("Add color selection"), "effect.add.colorSelection", json!({}), mask_only),
-        item(ic::ANCHOR, n_("Anchor point"), n_("Add anchor point"), "effect.add.anchor", json!({"target": target}), anywhere),
-    ]
+    ];
+    // An anchor point records layer content, so the mask thumbnail menu leaves it out.
+    if !force_mask {
+        items.push(item(ic::ANCHOR, n_("Anchor point"), n_("Add anchor point"), "effect.add.anchor", json!({"target": target}), anywhere));
+    }
+    items
 }
 
 /// The command of Add mask's Bitmap: the texture picker opens first and adds the mask with the picked texture

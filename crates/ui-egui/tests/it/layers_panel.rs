@@ -325,8 +325,8 @@ fn the_mask_thumbnail_menu_adds_effects_to_the_mask() {
     right_click(&mut h, at);
     assert_eq!(h.state().session.target, StackTarget::Content, "opening the menu does not select a different target");
     assert!(
-        h.query_by_label(&format!("{}  Add anchor point", egui_phosphor::regular::ANCHOR)).is_some(),
-        "the mask menu retains the current mask anchor option"
+        h.query_by_label(&format!("{}  Add anchor point", egui_phosphor::regular::ANCHOR)).is_none(),
+        "the mask menu leaves out anchor points, which record layer content"
     );
     h.get_by_label(&format!("{}  Add fill", egui_phosphor::regular::PAINT_BUCKET)).click();
     h.run_steps(3);
