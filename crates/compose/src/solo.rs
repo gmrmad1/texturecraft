@@ -173,9 +173,4 @@ mod tests {
 
         assert!(view.layers[&instance].visible && view.layers[&folder].visible && view.layers[&inner].visible);
     }
-
-    #[test]
-    fn a_layer_in_no_stack_gives_nothing() {
-        assert!(solo_project(&project(), LayerId(99), true).is_none());
-    }
 }

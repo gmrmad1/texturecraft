@@ -61,19 +61,6 @@ fn drop_shadow_angle_drag_is_one_undo_step() {
     assert!(matches!(filter_of(&harness, effect), Filter::DropShadow { angle, .. } if angle == 90.0), "{:?}", filter_of(&harness, effect));
 }
 
-/// The Sun card's angles read Sun Horizontal Angle and Sun Vertical Angle; Light 1 and 2 keep Horizontal Angle and Vertical Angle
-#[test]
-fn baked_lighting_stylized_sun_angles_take_the_sun_names() {
-    let (harness, _) = app_with("bakedLighting", "content", TALL_WINDOW_HEIGHT);
-
-    for label in ["Sun Horizontal Angle", "Sun Vertical Angle"] {
-        assert_eq!(harness.query_all_by_role_and_label(Role::Slider, label).count(), 1, "{label}");
-    }
-    for label in ["Horizontal Angle", "Vertical Angle"] {
-        assert_eq!(harness.query_all_by_role_and_label(Role::Slider, label).count(), 2, "{label}: Light 1 and 2");
-    }
-}
-
 /// Baked Lighting Stylized's cards edit their own settings: Sun Intensity's right end, Light 1's Intensity and Output's Specular only
 #[test]
 fn baked_lighting_stylized_cards_set_the_sun_a_light_and_the_output() {

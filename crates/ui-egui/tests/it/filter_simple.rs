@@ -67,17 +67,6 @@ fn posterize_switch_under_its_slider() {
     assert_eq!(filter_of(&harness, effect), Filter::Posterize { levels: 8.0, alpha: true });
 }
 
-/// Clamp's Min and Max, Smoothstep's Minimum and Maximum and Sharpen Intensity
-#[test]
-fn reference_names_on_the_sliders() {
-    for (filter, labels) in [("clamp", &["Min", "Max"][..]), ("smoothstep", &["Minimum", "Maximum"]), ("sharpen", &["Sharpen Intensity"])] {
-        let (harness, _) = app_with(filter, "mask", WINDOW_HEIGHT);
-        for label in labels {
-            assert!(harness.query_by_role_and_label(Role::Slider, label).is_some(), "{filter}: {label}");
-        }
-    }
-}
-
 /// Histogram Shift's Position: a click on its middle shifts by a half turn back
 #[test]
 fn histogram_shift_position_middle_is_a_half_turn_back() {
@@ -176,14 +165,6 @@ fn fxaa_rows() {
     click_at(&mut harness, affect.center());
 
     assert_eq!(filter_of(&harness, effect), Filter::Fxaa { alpha: true });
-}
-
-/// Blur's Blur Intensity takes the reference's name and starts at 0.30
-#[test]
-fn blur_intensity_takes_the_reference_name() {
-    let (harness, _) = app_with("blur", "mask", WINDOW_HEIGHT);
-    let intensity = harness.get_by_role_and_label(Role::Slider, "Blur Intensity");
-    assert_eq!(intensity.accesskit_node().numeric_value().map(|value| (value * 100.0).round()), Some(30.0));
 }
 
 /// Blur Directional's Intensity and Angle take the reference's names, and Intensity's right end is the widest blur

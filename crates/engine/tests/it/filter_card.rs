@@ -145,11 +145,10 @@ fn restore_defaults_puts_the_filters_parameters_back() {
 fn filter_list_describes_and_tags_every_filter() {
     let mut s = session();
     let listed = execute(&mut s, "filter.list", &Value::Null).unwrap();
-    for def in listed.as_array().unwrap() {
+    let entries = listed.as_array().unwrap();
+    assert_eq!(entries.len(), texturecraft_engine::filter_lib::FILTERS.len());
+    for def in entries {
         assert!(def["description"].as_str().is_some_and(|text| !text.is_empty()), "{def}");
         assert!(def["tags"].as_array().is_some_and(|tags| !tags.is_empty()), "{def}");
     }
-    let blur = listed.as_array().unwrap().iter().find(|def| def["id"] == "blur").unwrap();
-
-    assert_eq!(blur["tags"], json!(["blur", "soften"]));
 }

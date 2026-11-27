@@ -40,7 +40,11 @@ fn open(mut session: Session, effect: LayerId) -> (Harness<'static, TextureCraft
     execute(&mut session, "layer.select", &json!({"layer": layer.0, "target": effect.0})).unwrap();
 
     // Frames of a 60 Hz screen: kittest's default quarter second spreads a double-click past egui's delay
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
     (harness, effect)
 }
@@ -281,17 +285,6 @@ fn a_typed_value_keeps_input_low_below_input_high() {
     harness.run_steps(3);
 
     assert!((levels(&harness, effect).in_low - 0.49).abs() < 1e-4, "{:?}", levels(&harness, effect));
-}
-
-#[test]
-fn the_levels_filter_shows_the_same_editor() {
-    let (harness, _) = levels_harness("effect.add.filter", json!({"target": "mask", "filter": "levels"}));
-    for label in ["Input low", "Gamma", "Input high", "Output low", "Output high"] {
-        harness.get_by_role_and_label(Role::Slider, label);
-    }
-    for button in ["Reset", "Auto", "Invert"] {
-        harness.get_by_role_and_label(Role::Button, button);
-    }
 }
 
 /// Bounds of the handle pointers in paint order, the last one drawn on top

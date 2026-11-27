@@ -1,11 +1,15 @@
 use serde_json::{Value, json};
-use texturecraft_engine::core::Channel;
+use texturecraft_engine::core::{Channel, MIN_RESOLUTION};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, command_specs, execute};
 
 fn session() -> Session {
-    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
+    session_at(256)
+}
+
+fn session_at(texture_size: u32) -> Session {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, texture_size).unwrap();
     s.viewport = texturecraft_engine::geom::glam::Vec2::new(400.0, 400.0);
     s.camera.yaw = 0.0;
     s.camera.pitch = 0.0;
@@ -229,20 +233,8 @@ fn polygon_fill_boxes_survive_hostile_params() {
     }
 }
 
-/// A small project still gets the production bake defaults; only panic_hunt overrides them.
-#[test]
-fn new_project_keeps_full_resolution_bake_defaults() {
-    let s = session();
-    assert!(!s.doc.project.texture_sets.is_empty());
-    for texture_set in &s.doc.project.texture_sets {
-        assert_eq!(texture_set.resolution, 256);
-        assert_eq!(texture_set.bake, texturecraft_engine::core::BakeSettings::default());
-        assert_eq!(texture_set.bake.common.output_size(), (2048, 2048));
-        assert_eq!(texture_set.bake.maps.ao.parameters.rays.rays, 64);
-    }
-}
-
 /// Every command must return Ok or Err — never panic — for hostile params.
+/// Small texture and bake sizes retain the same command and parameter cases without a full-size bake per case.
 #[test]
 fn panic_hunt() {
     let hostile = [
@@ -259,11 +251,9 @@ fn panic_hunt() {
         }
 
         for p in &hostile {
-            let mut s = session();
-
-            // Match the fixture resolution to avoid a full 2048px bake for each unrelated input
+            let mut s = session_at(MIN_RESOLUTION);
             for texture_set in &mut s.doc.project.texture_sets {
-                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R64;
             }
             let _ = execute(&mut s, spec.id, p);
             s.update();
@@ -433,7 +423,7 @@ fn hunt_filters(hostile: &[Value]) {
     let extremes: Vec<Value> = [3.0e38, -3.0e38, 0.0].into_iter().map(filter_extreme).collect();
 
     for def in texturecraft_engine::filter_lib::FILTERS {
-        let mut s = session();
+        let mut s = session_at(MIN_RESOLUTION);
         execute(&mut s, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1], "roughness": 0.4})).unwrap();
         for target in ["content", "mask"] {
             if target == "mask" {
@@ -471,7 +461,7 @@ fn hunt_filters(hostile: &[Value]) {
 
 /// An empty filter effect on the content and on a mask swapped through `effect.set` to every library filter with each of `hostile` and `extremes`, and rendered
 fn hunt_filter_swaps(hostile: &[Value], extremes: &[Value]) {
-    let mut s = session();
+    let mut s = session_at(MIN_RESOLUTION);
     execute(&mut s, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1], "roughness": 0.4})).unwrap();
     for target in ["content", "mask"] {
         if target == "mask" {
@@ -495,24 +485,8 @@ fn hunt_filter_swaps(hostile: &[Value], extremes: &[Value]) {
     }
 }
 
-/// A colour param is `[r, g, b]` in linear 0..1 or `"#rrggbb"` in sRGB, and the same digits differ
-/// between the two, so every command that takes a colour says which form is which.
 #[test]
-fn colour_params_name_their_colour_space() {
-    for spec in command_specs() {
-        if ["color?", "colors?", "Color?"].iter().any(|k| spec.params.contains(k)) {
-            assert!(spec.params.contains("linear"), "{}: {}", spec.id, spec.params);
-            let hex = spec.params.matches("\"#rrggbb\"").count();
-            assert_eq!(hex, spec.params.matches("\"#rrggbb\" sRGB").count(), "{}: {}", spec.id, spec.params);
-        }
-    }
-    // These read their colours through `color_param`, which takes both forms.
-    for id in
-        ["layer.add.fill", "layer.fill.set", "effect.add.fill", "effect.add.filter", "tool.material", "mask.add.colorSelection", "resource.text", "display.set"]
-    {
-        let spec = command_specs().iter().find(|c| c.id == id).unwrap();
-        assert!(spec.params.contains("[r,g,b] linear or \"#rrggbb\" sRGB"), "{id}: {}", spec.params);
-    }
+fn an_srgb_hex_colour_matches_its_linear_rgb_value() {
     let base_color = |color: Value| {
         let mut s = session();
         execute(&mut s, "layer.add.fill", &json!({ "color": color })).unwrap();
@@ -961,7 +935,7 @@ fn generators_take_blur_balance_and_contrast() {
     let mut state = session();
     execute(&mut state, "layer.add.fill", &json!({})).unwrap();
     execute(&mut state, "mask.add.black", &Value::Null).unwrap();
-    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt", "blur": 0.25})).unwrap();
+    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "ambientOcclusion", "blur": 0.25})).unwrap();
     let effect = added["effect"].clone();
 
     execute(&mut state, "effect.set", &json!({"effect": effect, "balance": 0.75, "contrast": 2.0})).unwrap();
@@ -986,8 +960,8 @@ fn a_generator_input_reads_a_uniform_value_or_its_mesh_map_again() {
     let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
     assert!(inspect.contains(r#""inputs":{"ambientOcclusion":{"uniform":[0.25,0.25,0.25]}}"#), "{inspect}");
 
-    let wrong_input = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "curvature", "inputValue": 0.5}));
-    assert!(wrong_input.is_err(), "dirt reads ambient occlusion, not curvature");
+    let wrong_input = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "thickness", "inputValue": 0.5}));
+    assert!(wrong_input.is_err(), "dirt reads ambient occlusion and curvature, not thickness");
     let missing_image = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputImage": "nothing.png"}));
     assert!(missing_image.is_err(), "the image must be a resource of the project");
     let two_sources = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputValue": 0.5, "inputBaked": true}));

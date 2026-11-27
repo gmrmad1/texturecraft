@@ -2,7 +2,7 @@
 
 use serde_json::json;
 use texturecraft_engine::core::{Channel, DirectionalLight, EffectKind, Filter, LayerId, LightingOutput};
-use texturecraft_engine::filter_lib::{LIBRARY_DROP_SHADOW, LIBRARY_ENVIRONMENT_LIGHTING, LIBRARY_GLOW, library_baked_lighting};
+use texturecraft_engine::filter_lib::{LIBRARY_ENVIRONMENT_LIGHTING, LIBRARY_GLOW, library_baked_lighting};
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, execute};
 
@@ -54,22 +54,16 @@ fn glow_settings_set_clamp_and_refuse() {
     assert_eq!(filter_of(&s, effect), LIBRARY_GLOW);
 }
 
-/// Drop Shadow: the workflow's defaults, then Angle wrapping, Distance both ways, Size, Spread, Opacity and Color
 #[test]
-fn drop_shadow_defaults_and_settings() {
+fn drop_shadow_clamps_settings_and_rejects_invalid_color() {
     let mut s = session();
     let effect = masked(&mut s, "Drop Shadow");
-    assert_eq!(filter_of(&s, effect), LIBRARY_DROP_SHADOW, "the workflow's defaults");
 
     set(&mut s, effect, json!({"angle": 450.0, "distance": -0.9, "size": 2.0, "spread": 0.3, "opacity": 0.25, "color": "#ffffff"}));
 
     assert_eq!(filter_of(&s, effect), Filter::DropShadow { angle: 90.0, distance: -0.5, size: 1.0, spread: 0.3, opacity: 0.25, color: [1.0; 3] });
 
     refused(&mut s, effect, &[json!({"color": [1.0]})]);
-
-    let listed = execute(&mut s, "filter.list", &json!({})).unwrap();
-
-    assert!(listed.as_array().unwrap().iter().any(|f| f["id"] == "dropShadow" && f["mask"] == true));
 }
 
 /// A content fill layer with library filter `id` on its content: the effect

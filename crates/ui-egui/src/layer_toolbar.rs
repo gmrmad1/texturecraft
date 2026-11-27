@@ -111,7 +111,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     x += channel_width + CHANNEL_GAP;
 
     let selected = app.session.selected_layer().filter(|id| app.session.doc.project.layers.contains_key(id));
-    let effects = || effect_items(app, layer_of(app, selected), false);
+    let effects = || effect_items(app, layer_of(app, selected), false, false);
     let mut pick = menu_button(ui, control(x, top, MENU_BUTTON_WIDTH), tr("Add effect"), MenuIcon::Glyph(ic::MAGIC_WAND), tr("Add effect"), effects, &tokens);
     x += MENU_BUTTON_WIDTH + MENU_GAP;
     let masks = || mask_items(layer_of(app, selected));
@@ -362,11 +362,15 @@ fn run_on(app: &mut TextureCraftApp, ui: &Ui, layer: LayerId, command: &str, par
     }
 }
 
-/// The Add effect items for `layer`: in its mask for the mask thumbnail, otherwise on its
-/// content when selected and in its mask otherwise. Items that cannot go there are greyed.
-fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>, force_mask: bool) -> Vec<AddItem> {
-    let content =
-        !force_mask && layer.is_some_and(|layer| !layer.is_group() && app.session.selected_layer() == Some(layer.id) && crate::dock::targets_content(app));
+/// The Add effect items for `layer`: on its content when `content_thumbnail` (the menu of the
+/// layer's content thumbnail) or when the content is the selected target; in its mask when
+/// `force_mask` (the mask thumbnail menu) or otherwise when the mask is the target. An item that
+/// can't go there is greyed, not sent elsewhere (all of them without a layer).
+fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>, content_thumbnail: bool, force_mask: bool) -> Vec<AddItem> {
+    let content = !force_mask
+        && layer.is_some_and(|layer| {
+            content_thumbnail || (!layer.is_group() && app.session.selected_layer() == Some(layer.id) && crate::dock::targets_content(app))
+        });
     let target = if content { "content" } else { "mask" };
 
     // Generators, compare masks and colour selections go in masks only
@@ -405,9 +409,11 @@ fn mask_items(layer: Option<&Layer>) -> Vec<AddItem> {
     ]
 }
 
-/// Add effect items for the row or mask thumbnail context menu.
-pub(crate) fn effect_menu_items(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, force_mask: bool) {
-    for item in effect_items(app, Some(layer), force_mask) {
+/// Add effect items for the row or thumbnail context menu.
+/// `content_thumbnail`: the menu of the layer's content thumbnail, which adds to the content.
+/// `force_mask`: the menu of the mask thumbnail, which adds to the mask even if content is selected.
+pub(crate) fn effect_menu_items(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, content_thumbnail: bool, force_mask: bool) {
+    for item in effect_items(app, Some(layer), content_thumbnail, force_mask) {
         let text = format!("{}  {}", icon_of(item.icon), tr(item.long));
         if ui.add_enabled(item.enabled, egui::Button::new(text)).clicked() {
             if force_mask {

@@ -31,7 +31,7 @@ impl CommandSpec {
     /// that only return data or do nothing without parameters, and the ones that replace the
     /// open project (the menu asks to save first).
     pub fn bindable(&self) -> bool {
-        const NOT_FROM_A_KEY: [&str; 13] = [
+        const NOT_FROM_A_KEY: [&str; 14] = [
             "project.inspect",
             "project.templates",
             "project.new",
@@ -45,6 +45,7 @@ impl CommandSpec {
             "bake.preview",
             "camera.set",
             "textureSet.settings",
+            "resource.status",
         ];
         const NOTHING_WITHOUT_PARAMS: [&str; 4] = ["layer.blend", "tool.stencil", "tool.fillSelection", "tool.path"];
         !(self.id.ends_with(".list") || NOT_FROM_A_KEY.contains(&self.id) || NOTHING_WITHOUT_PARAMS.contains(&self.id)) && params_all_optional(self.params)
@@ -117,6 +118,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::layer_ops::specs());
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
+        v.extend(crate::generator_pick::specs());
         v.extend(crate::mask_export::specs());
         v.extend(crate::add_mask_cmds::specs());
         v.extend(crate::color_selection_cmds::specs());
@@ -143,6 +145,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::file_cmds::specs());
         v.extend(crate::preset_cmds::specs());
         v.extend(crate::resource_cmds::specs());
+        v.extend(crate::resource_update_cmds::specs());
         v.extend(crate::material_lib::specs());
         v.extend(crate::link_cmds::specs());
         v.extend(crate::smart_masks::specs());
@@ -448,7 +451,7 @@ mod tests {
     fn no_bindable_command_asks_for_a_parameter() {
         // Effect commands need a selected effect, which this session lacks
         for spec in command_specs().iter().filter(|c| c.bindable() && c.shortcut.is_none() && !c.id.starts_with("effect.")) {
-            let mut session = crate::sample_session(256, 64).unwrap();
+            let mut session = crate::sample_session(texturecraft_core::MIN_RESOLUTION, 16).unwrap();
             if (spec.enabled)(&session).is_ok()
                 && let Err(err) = execute(&mut session, spec.id, &Value::Null)
             {

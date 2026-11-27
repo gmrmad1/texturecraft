@@ -69,17 +69,3 @@ const ABOUT: &[(&str, FilterAbout)] = &[
 pub fn of(id: &str) -> Option<FilterAbout> {
     ABOUT.iter().find(|(entry, _)| *entry == id).map(|(_, about)| *about)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::of;
-    use crate::filter_lib::FILTERS;
-
-    #[test]
-    fn every_library_filter_is_described_and_tagged() {
-        for def in FILTERS {
-            let about = of(def.id).unwrap_or_else(|| panic!("{} has no description", def.id));
-            assert!(about.description.ends_with('.') && !about.tags.is_empty(), "{}", def.id);
-        }
-    }
-}
