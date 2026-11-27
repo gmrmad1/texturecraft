@@ -497,7 +497,6 @@ fn the_mask_thumbnail_menu_adds_effects_to_the_mask() {
     assert!(matches!(added.kind, texturecraft_engine::core::EffectKind::Fill { .. }));
     assert_eq!(h.state().session.target, StackTarget::Effect(added.id), "the new mask effect is selected");
 }
-}
 
 /// Click the eye of the top-level row `name` with `modifiers` held (the eye sits in the first 20 points after the 7-point edge).
 fn click_eye(h: &mut Harness<'_, TextureCraftApp>, name: &str, modifiers: egui::Modifiers) {
