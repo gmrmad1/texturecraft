@@ -19,7 +19,10 @@ const MENU_REACH: f32 = 60.0;
 /// The sample project (Ball = set 0, Base = set 1) with the Ball selected, at 1600 x 960
 fn sample_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     assert_eq!(harness.state().session.ts(), 0);
     harness
@@ -45,7 +48,7 @@ fn drop_material(harness: &mut Harness<'_, TextureCraftApp>, position: Pos2) {
 
 /// Drop shelf `asset` at `position`, as a drag from the shelf ends there
 fn drop_asset(harness: &mut Harness<'_, TextureCraftApp>, asset: Asset, position: Pos2) {
-    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset, label: "Dragged".into() });
+    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset, label: "Dragged".into(), thumb: None });
     harness.hover_at(position);
     harness.run_steps(2);
 
@@ -249,18 +252,18 @@ fn changing_the_camera_cancels_a_drop_with_stale_view_coordinates() {
 }
 
 #[test]
-fn the_click_that_closes_the_drop_menu_does_not_move_a_decal_being_placed() {
+fn the_click_that_closes_the_drop_menu_paints_nothing_and_adds_no_undo_step() {
     let (mut harness, position) = drop_image(Some(1));
     let distance = |node: &egui_kittest::Node<'_>| node.rect().center().distance(position);
     harness.get_all_by_label("Roughness").min_by(|a, b| distance(a).total_cmp(&distance(b))).unwrap().click();
     harness.run_steps(2);
-    let decal_layer = harness.state().session.selected_layer().unwrap();
-    harness.state_mut().placing_decal = Some(decal_layer);
 
     let image = import_white_image(&mut harness);
     drop_asset(&mut harness, Asset::Texture(image), position);
     harness.run_steps(2);
+
     assert!(menu_open(&harness, position));
+
     let history = harness.state().session.history_labels().len();
 
     // A point on the same set, away from the menu
@@ -281,7 +284,7 @@ fn the_click_that_closes_the_drop_menu_does_not_move_a_decal_being_placed() {
     harness.run_steps(2);
 
     assert!(!menu_open(&harness, position));
-    assert_eq!(harness.state().session.history_labels().len(), history, "the decal wasn't moved");
+    assert_eq!(harness.state().session.history_labels().len(), history, "the closing click painted nothing");
 }
 
 #[test]
@@ -291,7 +294,11 @@ fn image_drop_menu_snapshots() {
 
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     let image = import_white_image(&mut harness);
@@ -309,4 +316,44 @@ fn image_drop_menu_snapshots() {
     assert_eq!(harness.state().session.ts(), 1);
     assert!(matches!(harness.state().session.target, texturecraft_engine::StackTarget::Effect(_)));
     harness.render().unwrap().save(directory.join("image-drop-mask.png")).unwrap();
+}
+
+/// The names of the Ball's top-level layers, bottom to top
+fn ball_stack_names(harness: &Harness<'_, TextureCraftApp>) -> Vec<String> {
+    let project = &harness.state().session.doc.project;
+    project.texture_sets[0].stack.iter().map(|id| project.layer(*id).unwrap().name.clone()).collect()
+}
+
+#[test]
+fn a_material_dropped_on_the_view_becomes_a_fill_layer_at_the_top_whatever_is_selected() {
+    let mut harness = sample_app();
+    let bottom = harness.state().session.doc.project.texture_sets[0].stack[0];
+    texturecraft_engine::execute(&mut harness.state_mut().session, "layer.select", &serde_json::json!({"layer": bottom.0})).unwrap();
+    harness.run_steps(2);
+    let before = ball_stack_names(&harness);
+
+    let ball = point_over(&harness, Some(0));
+    drop_asset(&mut harness, Asset::Material("copper"), ball);
+
+    let after = ball_stack_names(&harness);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after.last().map(String::as_str), Some("Copper"), "the new layer is on top: {after:?}");
+    let app = harness.state();
+    let layer = app.session.doc.project.layer(*app.session.doc.project.texture_sets[0].stack.last().unwrap()).unwrap();
+    assert!(matches!(layer.kind, texturecraft_engine::core::LayerKind::Fill(_)));
+    assert!(layer.mask.is_none(), "no mask");
+}
+
+#[test]
+fn a_material_dropped_on_a_layer_row_goes_directly_below_that_row() {
+    let mut harness = sample_app();
+    let before = ball_stack_names(&harness);
+    let row_name = before.last().unwrap().clone();
+    let row = harness.get_by_label(&row_name).rect().center();
+
+    drop_asset(&mut harness, Asset::Material("copper"), row);
+
+    let mut expected = before.clone();
+    expected.insert(before.len() - 1, "Copper".into());
+    assert_eq!(ball_stack_names(&harness), expected, "below the dropped-on row, which stays on top");
 }

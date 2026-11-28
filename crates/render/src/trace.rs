@@ -23,7 +23,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_compose::{Composite, ImageRes};
 use texturecraft_core::Channel;
-use texturecraft_core::project::{DisplaySettings, ToneMapping};
+use texturecraft_core::project::{DisplaySettings, EnvAlignment, LEGACY_DIELECTRIC_F0_SCALE, ToneMapping};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 
@@ -47,6 +47,8 @@ pub struct TraceScene {
     pub env: Arc<EnvImage>,
     /// Environment rotation around +Y (radians), as in the viewport.
     pub env_rotation: f32,
+    /// The environment turns with the camera about the vertical axis (Environment Alignment: Camera).
+    pub env_camera: bool,
     /// Texture set per triangle (`usize::MAX`: none, default material).
     pub(crate) tri_set: Arc<Vec<usize>>,
     /// Importance sampling of the environment (None for an empty image).
@@ -61,6 +63,8 @@ pub struct TraceScene {
     pub(crate) radius: f32,
     /// Index of refraction of the Transmission channel.
     pub ior: f32,
+    /// Multiplier for Specular Level in the Metallic/Roughness model.
+    pub(crate) dielectric_f0_scale: f32,
     /// Thin lens: focus depth along the view axis (0: the camera's orbit target) and lens radius
     /// as a fraction of the mesh's bounding radius (the viewport's depth of field).
     pub lens: Option<[f32; 2]>,
@@ -93,6 +97,7 @@ impl TraceScene {
             sets,
             env,
             env_rotation,
+            env_camera: false,
             tri_set: Arc::new(tri_set),
             light,
             spec_gloss: false,
@@ -100,6 +105,7 @@ impl TraceScene {
             scatter_sigma: Vec3::ONE,
             radius,
             ior: 1.5,
+            dielectric_f0_scale: LEGACY_DIELECTRIC_F0_SCALE,
             lens: None,
         };
         let d = DisplaySettings::default();
@@ -130,9 +136,11 @@ impl TraceScene {
     /// [`TraceScene::for_display`] under `env`, from [`TraceScene::display_env`] of the same display.
     pub fn for_display_env(mesh: Arc<Mesh>, bvh: Arc<Bvh>, sets: Vec<TraceSet>, display: &DisplaySettings, env: Arc<EnvImage>) -> TraceScene {
         let mut scene = TraceScene::new(mesh, bvh, sets, env, display.env_rotation.to_radians());
+        scene.env_camera = display.env_alignment == EnvAlignment::Camera;
         scene.spec_gloss = display.spec_gloss;
         scene.set_scatter(display.scatter_color, display.scatter_radius);
         scene.ior = display.ior;
+        scene.dielectric_f0_scale = display.dielectric_f0_scale();
         scene.lens = display.dof.enabled.then_some([display.dof.focus_distance, display.dof.aperture]);
 
         scene
@@ -159,25 +167,23 @@ impl TraceScene {
     }
 
     /// World direction to environment space.
-    fn to_env(&self, d: Vec3) -> Vec3 {
-        let (s, c) = self.env_rotation.sin_cos();
-        Vec3::new(c * d.x - s * d.z, d.y, s * d.x + c * d.z)
+    fn to_env(direction: Vec3, (sin, cos): (f32, f32)) -> Vec3 {
+        Vec3::new(cos * direction.x - sin * direction.z, direction.y, sin * direction.x + cos * direction.z)
     }
 
-    fn env(&self, d: Vec3) -> Vec3 {
-        self.env.sample(self.to_env(d))
+    fn env(&self, direction: Vec3, rotation: (f32, f32)) -> Vec3 {
+        self.env.sample(Self::to_env(direction, rotation))
     }
 
     /// Solid-angle density of [`Self::sample_env`] picking world direction `d`.
-    fn env_pdf(&self, d: Vec3) -> f32 {
-        self.light.as_ref().map_or(0.0, |l| l.pdf(self.to_env(d)))
+    fn env_pdf(&self, direction: Vec3, rotation: (f32, f32)) -> f32 {
+        self.light.as_ref().map_or(0.0, |light| light.pdf(Self::to_env(direction, rotation)))
     }
 
     /// A world direction toward the environment, chosen by brightness, with its density.
-    fn sample_env(&self, rng: &mut Rng) -> Option<(Vec3, f32)> {
-        let (e, pdf) = self.light.as_ref()?.sample(rng.next(), rng.next(), rng.next(), rng.next())?;
-        let (s, c) = self.env_rotation.sin_cos();
-        Some((Vec3::new(c * e.x + s * e.z, e.y, -s * e.x + c * e.z), pdf))
+    fn sample_env(&self, rng: &mut Rng, (sin, cos): (f32, f32)) -> Option<(Vec3, f32)> {
+        let (direction, pdf) = self.light.as_ref()?.sample(rng.next(), rng.next(), rng.next(), rng.next())?;
+        Some((Vec3::new(cos * direction.x + sin * direction.z, direction.y, -sin * direction.x + cos * direction.z), pdf))
     }
 }
 
@@ -199,16 +205,22 @@ impl EnvSampler {
         if w == 0 || h == 0 || env.data.len() < w * h {
             return None;
         }
-        let mut weight: Vec<f32> = env.data.iter().take(w * h).map(|c| luminance(Vec3::from(*c)).max(0.0)).collect();
-        for (y, row) in weight.chunks_mut(w).enumerate() {
+
+        let mut prob: Vec<f32> = env.data.iter().take(w * h).map(|c| luminance(Vec3::from(*c)).max(0.0)).collect();
+        for (y, row) in prob.chunks_mut(w).enumerate() {
             let sin = (PI * (y as f32 + 0.5) / h as f32).sin();
             row.iter_mut().for_each(|v| *v = (*v + 1e-4) * sin);
         }
-        let total: f32 = weight.iter().sum();
+
+        let total: f32 = prob.iter().sum();
         if !total.is_finite() || total <= 0.0 {
             return None;
         }
-        let prob: Vec<f32> = weight.iter().map(|v| v / total).collect();
+
+        for probability in &mut prob {
+            *probability /= total;
+        }
+
         let mut rows = Vec::with_capacity(h);
         let mut cols = Vec::with_capacity(w * h);
         let mut acc_rows = 0.0;
@@ -222,6 +234,7 @@ impl EnvSampler {
                 cols.push(acc);
             }
         }
+
         Some(EnvSampler { width: w, height: h, rows, cols, prob })
     }
 
@@ -255,12 +268,20 @@ pub struct TraceDisplay {
     pub env_opacity: f32,
     /// Filter the remaining noise (edge-aware; keeps texture detail).
     pub denoise: bool,
+    /// The plain background behind the mesh at the top and at the bottom of the view (linear RGB).
+    pub background: [[f32; 3]; 2],
 }
 
 impl TraceDisplay {
     /// Exposure, tone mapping and background as the viewport shows them.
     pub fn from_display(d: &DisplaySettings) -> TraceDisplay {
-        TraceDisplay { exposure: d.env_exposure.exp2(), aces: d.tone_mapping == ToneMapping::AcesFilmic, env_opacity: d.env_opacity, denoise: false }
+        TraceDisplay {
+            exposure: d.env_exposure.exp2(),
+            aces: d.tone_mapping == ToneMapping::AcesFilmic,
+            env_opacity: d.env_opacity,
+            denoise: false,
+            background: crate::DEFAULT_BACKGROUND,
+        }
     }
 }
 
@@ -325,6 +346,8 @@ impl Tracer {
     /// new sample then counts in [`Tracer::samples`]). Lets a single-threaded caller spread a
     /// pass over several frames.
     pub fn pass_rows(&mut self, scene: &TraceScene, cam: &OrbitCamera, settings: &TraceSettings, rows: u32) -> bool {
+        let rotation = if scene.env_camera { scene.env_rotation + crate::renderer::camera_yaw(cam) } else { scene.env_rotation };
+        let env_rotation = rotation.sin_cos();
         let (w, h, pass) = (self.width, self.height, self.samples);
         let aspect = w as f32 / h as f32;
         let (y0, y1) = (self.row, self.row.saturating_add(rows.max(1)).min(h));
@@ -335,7 +358,7 @@ impl Tracer {
                 let mut rng = Rng::new(x as u32, y as u32, pass);
                 let ndc = Vec2::new((x as f32 + rng.next()) / w as f32 * 2.0 - 1.0, 1.0 - (y as f32 + rng.next()) / h as f32 * 2.0);
                 let ray = scene.camera_ray(cam, ndc, aspect, &mut rng);
-                match trace(scene, ray.origin, ray.dir, settings, &mut rng) {
+                match trace(scene, ray.origin, ray.dir, settings, env_rotation, &mut rng) {
                     Some(s) => {
                         px.hit += s.radiance;
                         px.hit_lum2 += luminance(s.radiance).powi(2);
@@ -344,7 +367,7 @@ impl Tracer {
                         px.depth += s.depth;
                         px.hits += 1.0;
                     }
-                    None => px.env += scene.env(ray.dir),
+                    None => px.env += scene.env(ray.dir, env_rotation),
                 }
             }
         });
@@ -368,7 +391,7 @@ impl Tracer {
             let uv = Vec2::new(((i as u32 % self.width) as f32 + 0.5) / w, ((i as u32 / self.width) as f32 + 0.5) / h);
             let a = px.hits / n;
             let misses = n - px.hits;
-            let back = if misses > 0.0 { backdrop(uv).lerp(tonemap(px.env / misses, d), d.env_opacity.clamp(0.0, 1.0)) } else { backdrop(uv) };
+            let back = if misses > 0.0 { backdrop(uv, d).lerp(tonemap(px.env / misses, d), d.env_opacity.clamp(0.0, 1.0)) } else { backdrop(uv, d) };
             let mean = denoised.get(i).copied().unwrap_or(px.hit / px.hits.max(1.0));
             let scene = if px.hits > 0.0 { tonemap(mean, d) } else { Vec3::ZERO };
             let c = back.lerp(scene, a);
@@ -455,10 +478,9 @@ impl Tracer {
     }
 }
 
-/// The viewport's studio backdrop: a cool slate, lighter at the top (matches the post pass).
-fn backdrop(uv: Vec2) -> Vec3 {
-    let d = uv * 2.0 - Vec2::ONE;
-    Vec3::new(0.0295, 0.0343, 0.0437).lerp(Vec3::new(0.0110, 0.0130, 0.0168), uv.y) * (1.0 - 0.09 * d.length_squared())
+/// The viewport's plain background, top to bottom (matches the post pass).
+fn backdrop(uv: Vec2, d: &TraceDisplay) -> Vec3 {
+    Vec3::from(d.background[0]).lerp(Vec3::from(d.background[1]), uv.y)
 }
 
 fn tonemap(hdr: Vec3, d: &TraceDisplay) -> Vec3 {
@@ -528,100 +550,115 @@ fn rnm(base: Vec3, detail: Vec3) -> Vec3 {
     (t * t.dot(u) - u * t.z).normalize_or(Vec3::Z)
 }
 
-fn surface(scene: &TraceScene, tri: u32, u: f32, v: f32, o: Vec3, d: Vec3, t: f32) -> Option<Surface> {
-    let m = &scene.mesh;
-    let i = tri as usize * 3;
-    let idx = [*m.indices.get(i)? as usize, *m.indices.get(i + 1)? as usize, *m.indices.get(i + 2)? as usize];
-    let p = idx.map(|k| m.positions.get(k).copied().unwrap_or(Vec3::ZERO));
-    let mut geo = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(Vec3::Y);
-    let nrm = idx.map(|k| m.normals.get(k).copied().unwrap_or(geo));
-    let mut n_geo = lerp3(nrm[0], nrm[1], nrm[2], u, v).normalize_or(geo);
-    let front = geo.dot(d) <= 0.0;
+fn surface(scene: &TraceScene, triangle: u32, u: f32, v: f32, origin: Vec3, direction: Vec3, distance: f32) -> Option<Surface> {
+    // Match the minimum roughness in the GPU tracer
+    const SPECULAR_ROUGHNESS_FLOOR: f32 = 0.045;
+    const SHEEN_ROUGHNESS_FLOOR: f32 = 0.07;
+    const HEIGHT_SLOPE_UV_DIVISOR: f32 = 16.0;
+
+    let mesh = &scene.mesh;
+    let first_index = triangle as usize * 3;
+    let indices = [*mesh.indices.get(first_index)? as usize, *mesh.indices.get(first_index + 1)? as usize, *mesh.indices.get(first_index + 2)? as usize];
+    let points = indices.map(|index| mesh.positions.get(index).copied().unwrap_or(Vec3::ZERO));
+    let mut geo = (points[1] - points[0]).cross(points[2] - points[0]).normalize_or(Vec3::Y);
+    let normals = indices.map(|index| mesh.normals.get(index).copied().unwrap_or(geo));
+    let mut interpolated_normal = lerp3(normals[0], normals[1], normals[2], u, v).normalize_or(geo);
+
+    let front = geo.dot(direction) <= 0.0;
     if !front {
         geo = -geo;
     }
-    if n_geo.dot(geo) < 0.0 {
-        n_geo = -n_geo;
+    if interpolated_normal.dot(geo) < 0.0 {
+        interpolated_normal = -interpolated_normal;
     }
-    let uvs = idx.map(|k| m.uvs.get(k).copied().unwrap_or(Vec2::ZERO));
-    let uv = uvs[0] * (1.0 - u - v) + uvs[1] * u + uvs[2] * v;
-    let tan = idx.map(|k| m.tangents.get(k).copied().unwrap_or(texturecraft_geom::glam::Vec4::X));
-    let tw = lerp3(tan[0].truncate(), tan[1].truncate(), tan[2].truncate(), u, v);
-    let sign = if tan[0].w < 0.0 { -1.0 } else { 1.0 };
 
-    let set = scene.tri_set.get(tri as usize).and_then(|s| scene.sets.get(*s));
-    // The composite texel at offset (dx, dy) from the hit.
-    let texel = |s: &TraceSet, dx: i32, dy: i32| {
-        let (w, h) = (s.composite.resolution.max(1) as i32, s.composite.height.max(1) as i32);
-        (((uv.x * w as f32).floor() as i32 + dx).rem_euclid(w) as u32, ((uv.y * h as f32).floor() as i32 + dy).rem_euclid(h) as u32)
-    };
-    let ch = |c: Channel, dx: i32, dy: i32| -> [f32; 3] {
-        let Some(s) = set else { return c.default_value() };
-        let (x, y) = texel(s, dx, dy);
-        s.composite.value(c, x, y)
-    };
-    let base = Vec3::from(ch(Channel::BaseColor, 0, 0));
-    // A UV tile smaller than its atlas block has fewer texels per UV unit: slopes per texel shrink.
-    let k = set.map_or(0.0, |s| {
-        let (x, y) = texel(s, 0, 0);
-        s.height_strength * s.composite.resolution as f32 / 16.0 * s.composite.block_scales.at(x, y)
+    let uvs = indices.map(|index| mesh.uvs.get(index).copied().unwrap_or(Vec2::ZERO));
+    let uv = uvs[0] * (1.0 - u - v) + uvs[1] * u + uvs[2] * v;
+    let tangents = indices.map(|index| mesh.tangents.get(index).copied().unwrap_or(texturecraft_geom::glam::Vec4::X));
+    let mesh_tangent = lerp3(tangents[0].truncate(), tangents[1].truncate(), tangents[2].truncate(), u, v);
+    let sign = if tangents[0].w < 0.0 { -1.0 } else { 1.0 };
+
+    let surface_texel = scene.tri_set.get(triangle as usize).and_then(|index| scene.sets.get(*index)).map(|set| {
+        let width = set.composite.resolution.max(1);
+        let height = set.composite.height.max(1);
+        let x = ((uv.x * width as f32).floor() as i32).rem_euclid(width as i32) as u32;
+        let y = ((uv.y * height as f32).floor() as i32).rem_euclid(height as i32) as u32;
+        (set, [width, height], [x, y])
     });
-    let n_height = if k != 0.0 {
-        let h = |dx, dy| ch(Channel::Height, dx, dy)[0];
-        Vec3::new(-(h(1, 0) - h(-1, 0)) * 0.5 * k, (h(0, 1) - h(0, -1)) * 0.5 * k, 1.0).normalize_or(Vec3::Z)
-    } else {
-        Vec3::Z
-    };
-    let detail = (Vec3::from(ch(Channel::Normal, 0, 0)) * 2.0 - Vec3::ONE).normalize_or(Vec3::Z);
-    let n_ts = rnm(n_height, detail);
-    let tt = (tw - n_geo * n_geo.dot(tw)).normalize_or(n_geo.any_orthonormal_vector());
-    let b = n_geo.cross(tt) * sign;
-    let mut n = (tt * n_ts.x + b * n_ts.y + n_geo * n_ts.z).normalize_or(n_geo);
-    if n.dot(-d) <= 0.0 {
-        n = n_geo;
+    let sample_channel = |channel: Channel| surface_texel.map_or_else(|| channel.default_value(), |(set, _, [x, y])| set.composite.value(channel, x, y));
+    let base = Vec3::from(sample_channel(Channel::BaseColor));
+
+    // A unit height across one sixteenth of the UV width tilts 45°
+    // A smaller tile reduces the number of texels across that span
+    let height_normal = surface_texel.map_or(Vec3::Z, |(set, [width, height], [x, y])| {
+        let strength = set.height_strength * set.composite.resolution as f32 / HEIGHT_SLOPE_UV_DIVISOR * set.composite.block_scales.at(x, y);
+        if strength == 0.0 {
+            return Vec3::Z;
+        }
+
+        // Neighbors wrap independently across each axis
+        let previous = |position, size| if position == 0 { size - 1 } else { position - 1 };
+        let next = |position, size| if position + 1 == size { 0 } else { position + 1 };
+        let height_at = |x, y| set.composite.value(Channel::Height, x, y)[0];
+        let slope_x = height_at(next(x, width), y) - height_at(previous(x, width), y);
+        let slope_y = height_at(x, next(y, height)) - height_at(x, previous(y, height));
+        Vec3::new(-slope_x * 0.5 * strength, slope_y * 0.5 * strength, 1.0).normalize_or(Vec3::Z)
+    });
+
+    let detail = (Vec3::from(sample_channel(Channel::Normal)) * 2.0 - Vec3::ONE).normalize_or(Vec3::Z);
+    let tangent_normal = rnm(height_normal, detail);
+    let base_tangent = (mesh_tangent - interpolated_normal * interpolated_normal.dot(mesh_tangent)).normalize_or(interpolated_normal.any_orthonormal_vector());
+    let bitangent = interpolated_normal.cross(base_tangent) * sign;
+    let mut normal =
+        (base_tangent * tangent_normal.x + bitangent * tangent_normal.y + interpolated_normal * tangent_normal.z).normalize_or(interpolated_normal);
+    if normal.dot(-direction) <= 0.0 {
+        normal = interpolated_normal;
     }
-    let scalar = |c: Channel| ch(c, 0, 0)[0].clamp(0.0, 1.0);
+
+    let scalar = |channel| sample_channel(channel)[0].clamp(0.0, 1.0);
     let (sin, cos) = (scalar(Channel::AnisotropyAngle) * PI).sin_cos();
-    let turned = tt * cos + b * sin;
-    let tangent = (turned - n * n.dot(turned)).normalize_or(n.any_orthonormal_vector());
-    // Glossiness replaces roughness wherever a set has it (as in the viewport).
-    let roughness = match set {
-        Some(s) if s.composite.channels.contains_key(&Channel::Glossiness) => 1.0 - ch(Channel::Glossiness, 0, 0)[0],
-        _ => ch(Channel::Roughness, 0, 0)[0],
+    let turned_tangent = base_tangent * cos + bitangent * sin;
+    let tangent = (turned_tangent - normal * normal.dot(turned_tangent)).normalize_or(normal.any_orthonormal_vector());
+
+    // Match the viewport's preference for Glossiness when both channels exist
+    let roughness = match surface_texel {
+        Some((set, _, _)) if set.composite.channels.contains_key(&Channel::Glossiness) => 1.0 - sample_channel(Channel::Glossiness)[0],
+        _ => sample_channel(Channel::Roughness)[0],
     };
     let (diffuse, f0, metallic) = if scene.spec_gloss {
-        let f0 = Vec3::from(ch(Channel::Specular, 0, 0)).clamp(Vec3::ZERO, Vec3::ONE);
+        let f0 = Vec3::from(sample_channel(Channel::Specular)).clamp(Vec3::ZERO, Vec3::ONE);
         (base * (1.0 - f0.max_element()), f0, 0.0)
     } else {
-        let metallic = ch(Channel::Metallic, 0, 0)[0].clamp(0.0, 1.0);
-        let level = ch(Channel::SpecularLevel, 0, 0)[0].clamp(0.0, 1.0);
-        (base * (1.0 - metallic), Vec3::splat(0.08 * level).lerp(base, metallic), metallic)
+        let metallic = sample_channel(Channel::Metallic)[0].clamp(0.0, 1.0);
+        let level = sample_channel(Channel::SpecularLevel)[0].clamp(0.0, 1.0);
+        (base * (1.0 - metallic), Vec3::splat(scene.dielectric_f0_scale * level).lerp(base, metallic), metallic)
     };
-    let coat_base = if n_geo.dot(-d) > 0.0 { n_geo } else { geo };
-    let coat_n = match set {
-        Some(s) if s.composite.channels.contains_key(&Channel::CoatNormal) => {
-            let c = (Vec3::from(ch(Channel::CoatNormal, 0, 0)) * 2.0 - Vec3::ONE).normalize_or(Vec3::Z);
-            let turned = (tt * c.x + b * c.y + coat_base * c.z).normalize_or(coat_base);
-            if turned.dot(-d) > 0.0 { turned } else { coat_base }
+    let coat_base = if interpolated_normal.dot(-direction) > 0.0 { interpolated_normal } else { geo };
+    let coat_n = match surface_texel {
+        Some((set, _, _)) if set.composite.channels.contains_key(&Channel::CoatNormal) => {
+            let detail = (Vec3::from(sample_channel(Channel::CoatNormal)) * 2.0 - Vec3::ONE).normalize_or(Vec3::Z);
+            let tilted = (base_tangent * detail.x + bitangent * detail.y + coat_base * detail.z).normalize_or(coat_base);
+            if tilted.dot(-direction) > 0.0 { tilted } else { coat_base }
         }
         _ => coat_base,
     };
+
     Some(Surface {
-        pos: o + d * t,
+        pos: origin + direction * distance,
         geo,
-        n,
+        n: normal,
         tangent,
         diffuse,
         f0,
-        roughness: roughness.clamp(0.045, 1.0),
-        emissive: Vec3::from(ch(Channel::Emissive, 0, 0)),
-        opacity: ch(Channel::Opacity, 0, 0)[0].clamp(0.0, 1.0),
+        roughness: roughness.clamp(SPECULAR_ROUGHNESS_FLOOR, 1.0),
+        emissive: Vec3::from(sample_channel(Channel::Emissive)),
+        opacity: sample_channel(Channel::Opacity)[0].clamp(0.0, 1.0),
         anisotropy: scalar(Channel::AnisotropyLevel),
         coat: scalar(Channel::CoatWeight),
-        coat_roughness: scalar(Channel::CoatRoughness).max(0.045),
+        coat_roughness: scalar(Channel::CoatRoughness).max(SPECULAR_ROUGHNESS_FLOOR),
         coat_n,
-        sheen: Vec3::from(ch(Channel::SheenColor, 0, 0)).clamp(Vec3::ZERO, Vec3::ONE) * scalar(Channel::SheenWeight),
-        sheen_roughness: scalar(Channel::SheenRoughness).max(0.07),
+        sheen: Vec3::from(sample_channel(Channel::SheenColor)).clamp(Vec3::ZERO, Vec3::ONE) * scalar(Channel::SheenWeight),
+        sheen_roughness: scalar(Channel::SheenRoughness).max(SHEEN_ROUGHNESS_FLOOR),
         scatter: scalar(Channel::ScatterWeight),
         transmission: scalar(Channel::Transmission) * (1.0 - metallic),
         base: base.clamp(Vec3::ZERO, Vec3::ONE),
@@ -957,41 +994,48 @@ fn clamp_firefly(c: Vec3) -> Vec3 {
 
 /// Next-event estimation toward the environment from `pos` (geometric normal `geo`): `eval`
 /// gives the BRDF × cos toward a direction and the density of the path's own sampling of it.
-fn next_event(scene: &TraceScene, pos: Vec3, geo: Vec3, thr: Vec3, rng: &mut Rng, eval: impl Fn(Vec3) -> (Vec3, f32)) -> Vec3 {
-    let Some((wl, pdf_env)) = scene.sample_env(rng) else { return Vec3::ZERO };
+fn next_event(scene: &TraceScene, pos: Vec3, geo: Vec3, thr: Vec3, env_rotation: (f32, f32), rng: &mut Rng, eval: impl Fn(Vec3) -> (Vec3, f32)) -> Vec3 {
+    let Some((wl, pdf_env)) = scene.sample_env(rng, env_rotation) else { return Vec3::ZERO };
+
     if wl.dot(geo) <= 0.0 {
         return Vec3::ZERO;
     }
+
     let (f, pdf_brdf) = eval(wl);
     if f.max_element() <= 0.0 || scene.bvh.occluded(pos + geo * scene.eps, wl, f32::MAX) {
         return Vec3::ZERO;
     }
-    clamp_firefly(thr * f * scene.env(wl) * (mis(pdf_env, pdf_brdf) / pdf_env))
+
+    clamp_firefly(thr * f * scene.env(wl, env_rotation) * (mis(pdf_env, pdf_brdf) / pdf_env))
 }
 
 /// Radiance along a camera ray; None when it misses the mesh. Environment light is gathered
 /// both by sampling it directly (next-event estimation) and by BRDF sampling, combined with MIS.
-fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings, rng: &mut Rng) -> Option<Sample> {
+fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings, env_rotation: (f32, f32), rng: &mut Rng) -> Option<Sample> {
     let origin = o;
     let mut first: Option<(Vec3, Vec3, f32)> = None;
     let mut thr = Vec3::ONE;
     let mut l = Vec3::ZERO;
     let mut bounce = 0u32;
-    // Density of the BRDF sample that produced `d` (None for the camera ray).
+
+    // Density of the BRDF sample that produced `d` (None for the camera ray)
     let mut brdf_pdf: Option<f32> = None;
-    // Cutout surfaces don't count as bounces; cap them so a stack of cards can't loop forever.
+
+    // Cutout surfaces don't count as bounces; cap them so a stack of cards can't loop forever
     for _ in 0..settings.bounces + 24 {
         let Some(hit) = scene.bvh.closest(o, d, f32::MAX) else {
             let pdf = brdf_pdf?;
-            let w = if scene.light.is_some() { mis(pdf, scene.env_pdf(d)) } else { 1.0 };
-            l += clamp_firefly(thr * scene.env(d) * w);
+            let w = if scene.light.is_some() { mis(pdf, scene.env_pdf(d, env_rotation)) } else { 1.0 };
+            l += clamp_firefly(thr * scene.env(d, env_rotation) * w);
             break;
         };
+
         let Some(s) = surface(scene, hit.tri, hit.u, hit.v, o, d, hit.t) else { break };
         if rng.next() > s.opacity {
             o = s.pos - s.geo * scene.eps;
             continue;
         }
+
         if first.is_none() {
             first = Some(((s.diffuse + s.f0).min(Vec3::ONE), s.n, (s.pos - origin).length()));
         }
@@ -999,14 +1043,15 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
         if bounce >= settings.bounces {
             break;
         }
-        // Transmission is picked by its weight (a glass event, without next-event estimation);
-        // otherwise the surface shades as if it had none.
+
+        // Transmission weight selects a glass event that skips next-event estimation
         let glass = s.transmission > 0.0 && rng.next() < s.transmission;
         let bsdf = Bsdf::new(&s, -d);
-        // The BRDF is sampled with probability 1 − p_walk (densities below include that).
+
+        // The BRDF is sampled with probability 1 − p_walk (densities below include that)
         let keep = 1.0 - bsdf.p_walk;
         if !glass {
-            l += next_event(scene, s.pos, s.geo, thr, rng, |wl| {
+            l += next_event(scene, s.pos, s.geo, thr, env_rotation, rng, |wl| {
                 let (f, pdf) = bsdf.eval(wl);
                 (f, pdf * keep)
             });
@@ -1020,8 +1065,9 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
         } else if bsdf.p_walk > 0.0 && rng.next() < bsdf.p_walk {
             let Some((exit, out, w)) = random_walk(scene, &s, rng) else { break };
             thr *= bsdf.walk_albedo * w / bsdf.p_walk;
-            // The light leaves the exit point like a Lambertian emitter.
-            l += next_event(scene, exit, out, thr, rng, |wl| {
+
+            // The light leaves the exit point like a Lambertian emitter
+            l += next_event(scene, exit, out, thr, env_rotation, rng, |wl| {
                 let c = wl.dot(out).max(0.0) / PI;
                 (Vec3::splat(c), c)
             });
@@ -1035,6 +1081,7 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
             if pdf <= 0.0 {
                 break;
             }
+
             thr *= f / (pdf * keep);
             brdf_pdf = Some(pdf * keep);
             o = s.pos;
@@ -1045,6 +1092,7 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
             if rng.next() > p {
                 break;
             }
+
             thr /= p;
         }
         let side = if wi.dot(geo) >= 0.0 { 1.0 } else { -1.0 };
@@ -1083,11 +1131,12 @@ mod tests {
             tr.pass(&s, &camera(), &TraceSettings::default());
         }
         assert_eq!(tr.samples, 8);
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let img = tr.rgba8(&d);
         assert_eq!(img.len(), 48 * 32 * 4);
         let px = |x: usize, y: usize| &img[(y * 48 + x) * 4..(y * 48 + x) * 4 + 3];
-        // The sphere (default material, lit by the studio) is brighter than the dark backdrop corner.
+
+        // The sphere (default material, lit by the studio) is brighter than the dark backdrop corner
         let center: u32 = px(24, 16).iter().map(|v| *v as u32).sum();
         let corner: u32 = px(0, 0).iter().map(|v| *v as u32).sum();
         assert!(center > corner + 60, "center {center} corner {corner}");
@@ -1095,11 +1144,32 @@ mod tests {
     }
 
     #[test]
+    fn the_cpu_tracer_turns_the_environment_with_the_camera_when_aligned_to_it() {
+        // The environment shows as the background, so the whole image follows its turn
+        let view = |camera_aligned: bool, yaw: f32| {
+            let mut s = scene("Sunset");
+            s.env_camera = camera_aligned;
+            let mut cam = camera();
+            cam.set_angles(yaw, 0.0);
+            let mut tr = Tracer::new(24, 12);
+            tr.pass(&s, &cam, &TraceSettings::default());
+            tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 1.0, denoise: false, background: crate::DEFAULT_BACKGROUND })
+        };
+        let difference = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as f32).sum::<f32>() / a.len() as f32;
+        let world = difference(&view(false, 0.0), &view(false, 1.8));
+        let camera_aligned = difference(&view(true, 0.0), &view(true, 1.8));
+        assert!(world > 3.0, "World: the environment stays put ({world})");
+        assert!(camera_aligned < world / 3.0, "Camera: the environment turns with the view ({camera_aligned} against {world})");
+    }
+
+    #[test]
     fn environment_shows_behind_the_mesh_with_opacity() {
         let s = scene("Overcast");
         let mut tr = Tracer::new(16, 8);
         tr.pass(&s, &camera(), &TraceSettings::default());
-        let corner = |opacity: f32| tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: opacity, denoise: false })[0];
+        let corner = |opacity: f32| {
+            tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: opacity, denoise: false, background: crate::DEFAULT_BACKGROUND })[0]
+        };
         assert!(corner(1.0) > corner(0.0) + 40);
     }
 
@@ -1112,8 +1182,15 @@ mod tests {
             let n = 40_000;
             let mut sum = Vec3::ZERO;
             for _ in 0..n {
-                sum += trace(s, Vec3::new(0.3, 0.4, 4.0), Vec3::new(-0.07, -0.1, -1.0).normalize(), &TraceSettings { bounces: 3 }, &mut rng)
-                    .map_or(Vec3::ZERO, |s| s.radiance);
+                sum += trace(
+                    s,
+                    Vec3::new(0.3, 0.4, 4.0),
+                    Vec3::new(-0.07, -0.1, -1.0).normalize(),
+                    &TraceSettings { bounces: 3 },
+                    s.env_rotation.sin_cos(),
+                    &mut rng,
+                )
+                .map_or(Vec3::ZERO, |s| s.radiance);
             }
             sum / n as f32
         };
@@ -1125,7 +1202,7 @@ mod tests {
     fn passes_split_into_row_slices_match_whole_passes() {
         let s = scene("Studio Soft");
         let (mut whole, mut sliced) = (Tracer::new(40, 30), Tracer::new(40, 30));
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
         for _ in 0..2 {
             whole.pass(&s, &camera(), &TraceSettings::default());
             let mut done = false;
@@ -1144,9 +1221,10 @@ mod tests {
         for _ in 0..4 {
             tr.pass(&s, &camera(), &TraceSettings::default());
         }
-        let raw = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false });
-        let clean = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true });
-        // Neighbour differences inside the ball (rows 18..30, columns 26..38) drop; the mean stays.
+        let raw = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND });
+        let clean = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true, background: crate::DEFAULT_BACKGROUND });
+
+        // Neighbour differences inside the ball (rows 18..30, columns 26..38) drop; the mean stays
         let stats = |img: &[u8]| {
             let px = |x: usize, y: usize| img[(y * 64 + x) * 4] as f32;
             let (mut diff, mut sum, mut n) = (0.0, 0.0, 0.0);
@@ -1196,7 +1274,8 @@ mod tests {
             if x * x + y * y > 0.97 {
                 continue;
             }
-            sum += trace(&s, Vec3::new(x, y, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, &mut rng).map_or(Vec3::ZERO, |s| s.radiance);
+            sum += trace(&s, Vec3::new(x, y, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, s.env_rotation.sin_cos(), &mut rng)
+                .map_or(Vec3::ZERO, |s| s.radiance);
             n += 1;
         }
         sum / n as f32
@@ -1225,8 +1304,7 @@ mod tests {
 
     #[test]
     fn lobes_sample_and_evaluate_consistently() {
-        // Light sampling and BRDF sampling (MIS) against BRDF sampling alone: equal means only
-        // when every lobe's density matches what it samples.
+        // Equal MIS and BSDF-only means require every lobe's density to match its sampling
         use Channel::*;
         let env = Arc::new(crate::ibl::environment("Studio Soft", 128));
         let lit = material_scene(
@@ -1249,8 +1327,15 @@ mod tests {
             let n = 100_000;
             let mut sum = Vec3::ZERO;
             for _ in 0..n {
-                sum += trace(s, Vec3::new(0.3, 0.4, 4.0), Vec3::new(-0.07, -0.1, -1.0).normalize(), &TraceSettings { bounces: 3 }, &mut rng)
-                    .map_or(Vec3::ZERO, |s| s.radiance);
+                sum += trace(
+                    s,
+                    Vec3::new(0.3, 0.4, 4.0),
+                    Vec3::new(-0.07, -0.1, -1.0).normalize(),
+                    &TraceSettings { bounces: 3 },
+                    s.env_rotation.sin_cos(),
+                    &mut rng,
+                )
+                .map_or(Vec3::ZERO, |s| s.radiance);
             }
             sum / n as f32
         };
@@ -1284,7 +1369,7 @@ mod tests {
 
     #[test]
     fn white_furnace_keeps_energy_bounded() {
-        // A uniform white environment: a white diffuse sphere must not exceed the environment.
+        // A uniform white environment: a white diffuse sphere must not exceed the environment
         let mesh = Arc::new(primitives::sphere(1.0, 24, 12));
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = Arc::new(EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] });
@@ -1293,7 +1378,8 @@ mod tests {
         let mut sum = Vec3::ZERO;
         let n = 4000;
         for _ in 0..n {
-            sum += trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, &mut rng).map_or(Vec3::ZERO, |s| s.radiance);
+            sum += trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, s.env_rotation.sin_cos(), &mut rng)
+                .map_or(Vec3::ZERO, |s| s.radiance);
         }
         let avg = sum / n as f32;
         assert!(avg.max_element() <= 1.05 && avg.min_element() > 0.3, "{avg}");
@@ -1317,7 +1403,12 @@ mod tests {
         let s = material_scene(Arc::new(EnvImage { width: w, height: h, data }), values);
         let mut rng = Rng::new(3, 1, 4);
         let n = 2000;
-        (0..n).map(|_| trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings::default(), &mut rng).map_or(Vec3::ZERO, |s| s.radiance)).sum::<Vec3>()
+        (0..n)
+            .map(|_| {
+                trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings::default(), s.env_rotation.sin_cos(), &mut rng)
+                    .map_or(Vec3::ZERO, |s| s.radiance)
+            })
+            .sum::<Vec3>()
             / n as f32
     }
 
@@ -1346,5 +1437,135 @@ mod tests {
         let (pinhole, focused, blurred) = (soft_edge(None), soft_edge(Some([4.0 - 0.25, 0.1])), soft_edge(Some([20.0, 0.1])));
         assert!(blurred > 3 * pinhole.max(10), "out of focus: {pinhole} -> {blurred} edge pixels");
         assert!(focused < pinhole + pinhole / 2 + 10, "the silhouette (about the focus depth) stays sharp: {pinhole} -> {focused}");
+    }
+
+    /// Specular Level 0.5 stands for OpenPBR's default specular weight of 1
+    const OPENPBR_DEFAULT_SPECULAR_LEVEL: f32 = 0.5;
+    /// A non-default IOR for the opt-in comparisons
+    const DENSE_IOR: f32 = 1.8;
+    /// The 32-bit export and the shading read the same 16-bit texel: only float rounding separates them
+    const F0_TOLERANCE: f32 = 1e-5;
+
+    /// One texture set holding a uniform dielectric with both shader models' channels.
+    fn dielectric_composite() -> Composite {
+        use Channel::*;
+        let values = [
+            (BaseColor, [0.1; 3]),
+            (Metallic, [0.0; 3]),
+            (Roughness, [0.3; 3]),
+            (SpecularLevel, [OPENPBR_DEFAULT_SPECULAR_LEVEL; 3]),
+            (Specular, [0.3, 0.2, 0.1]),
+            (Glossiness, [0.7; 3]),
+        ];
+        let channels: Vec<Channel> = values.iter().map(|(channel, _)| *channel).collect();
+        let mut composite = Composite::new(&channels, 8);
+        for (channel, value) in values {
+            let raw: Vec<u16> = value[..channel.components()].iter().map(|v| texturecraft_texel::to_u16(*v)).collect();
+            let image = composite.channels.get_mut(&channel).unwrap();
+            for y in 0..8 {
+                for x in 0..8 {
+                    image.set(x, y, &raw);
+                }
+            }
+        }
+        composite
+    }
+
+    /// A sphere covered by [`dielectric_composite`] under `display`.
+    fn dielectric_scene(display: &DisplaySettings) -> TraceScene {
+        let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let sets = vec![TraceSet { material: 0, composite: dielectric_composite(), height_strength: 0.0 }];
+        TraceScene::for_display_env(mesh, bvh, sets, display, Arc::new(crate::ibl::environment("Studio Soft", 32)))
+    }
+
+    /// The F0 the CPU tracer shades the sphere's front with.
+    fn shaded_f0(display: &DisplaySettings) -> Vec3 {
+        let scene = dielectric_scene(display);
+        let (origin, direction) = (Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z);
+        let hit = scene.bvh.closest(origin, direction, f32::MAX).unwrap();
+        surface(&scene, hit.tri, hit.u, hit.v, origin, direction, hit.t).unwrap().f0
+    }
+
+    #[test]
+    fn height_normals_sample_across_both_texture_edges() {
+        let mut mesh = primitives::plane(1.0, 1);
+        mesh.uvs.fill(Vec2::ZERO);
+        let mesh = Arc::new(mesh);
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let mut composite = Composite::with_size(&[Channel::Height], 4, 5);
+        let height = composite.channels.get_mut(&Channel::Height).unwrap();
+        height.set(3, 0, &[u16::MAX]);
+        height.set(0, 4, &[u16::MAX]);
+        let sets = vec![TraceSet { material: 0, composite, height_strength: 1.0 }];
+        let scene = TraceScene::new(mesh, bvh, sets, Arc::new(crate::ibl::environment("Studio Soft", 8)), 0.0);
+
+        let normal = surface(&scene, 0, 0.25, 0.25, Vec3::Y, Vec3::NEG_Y, 1.0).unwrap().n;
+
+        assert!(normal.x.abs() > f32::EPSILON && normal.z.abs() > f32::EPSILON, "the opposite edges tilt both axes: {normal}");
+    }
+
+    /// The F0 map a 32-bit float export writes for [`dielectric_composite`] under `display`.
+    fn exported_f0(display: &DisplaySettings) -> f32 {
+        use texturecraft_formats::{Dest, ExportInput, ExportOptions, ExportPreset, FileFormat, MapSpec, SourceRef, VirtualMap};
+
+        let composite = dielectric_composite();
+        let mut project = texturecraft_core::Project::new("F0", "builtin:sphere");
+        let mut set = texturecraft_core::TextureSet::new("Set", 0, composite.resolution);
+        set.channels = composite.channels.keys().map(|channel| (*channel, texturecraft_core::ChannelFormat::default_for(*channel))).collect();
+        project.texture_sets.push(set);
+        project.display = display.clone();
+        let coverage = vec![true; (composite.resolution * composite.resolution) as usize];
+        let input = ExportInput { project: &project, ts: 0, composite: &composite, baked: &Default::default(), coverage: &coverage, mesh_name: "sphere" };
+        let f0 = |component| SourceRef::Virtual { map: VirtualMap::F0, component };
+        let channels = vec![(Dest::R, f0(0)), (Dest::G, f0(1)), (Dest::B, f0(2))];
+        let map = MapSpec { file: "f0".into(), format: FileFormat::Exr, bit_depth: 32, channels, inverted: Vec::new() };
+        let options = ExportOptions::new(ExportPreset { name: "F0".into(), maps: vec![map] });
+
+        let files = texturecraft_formats::render_maps(&input, &options).unwrap();
+
+        let image = image::load_from_memory_with_format(&files[0].bytes, image::ImageFormat::OpenExr).unwrap().to_rgb32f();
+        image.get_pixel(4, 4)[0]
+    }
+
+    fn ior_display(ior: f32, ior_specular: bool, spec_gloss: bool) -> DisplaySettings {
+        DisplaySettings { ior, ior_specular, spec_gloss, ..DisplaySettings::default() }
+    }
+
+    #[test]
+    fn exported_f0_matches_the_metallic_roughness_shading_in_both_modes() {
+        let (legacy, opt_in) = (ior_display(DENSE_IOR, false, false), ior_display(DENSE_IOR, true, false));
+
+        // OpenPBR: at specular weight 1 the dielectric F0 is the Fresnel reflectance of the IOR
+        let fresnel = ((DENSE_IOR - 1.0) / (DENSE_IOR + 1.0)).powi(2);
+
+        let (legacy_shaded, legacy_exported) = (shaded_f0(&legacy), exported_f0(&legacy));
+        let (opt_in_shaded, opt_in_exported) = (shaded_f0(&opt_in), exported_f0(&opt_in));
+        let default_ior_shaded = shaded_f0(&ior_display(1.5, true, false));
+
+        for (mode, shaded, exported) in [("legacy", legacy_shaded, legacy_exported), ("IOR", opt_in_shaded, opt_in_exported)] {
+            assert!(shaded.abs_diff_eq(Vec3::splat(exported), F0_TOLERANCE), "{mode}: shaded {shaded}, exported {exported}");
+        }
+        assert!((legacy_exported - LEGACY_DIELECTRIC_F0_SCALE * OPENPBR_DEFAULT_SPECULAR_LEVEL).abs() < F0_TOLERANCE, "legacy {legacy_exported}");
+        assert!((opt_in_exported - fresnel).abs() < F0_TOLERANCE, "IOR {DENSE_IOR}: {opt_in_exported}, Fresnel {fresnel}");
+        assert!(opt_in_exported > legacy_exported, "IOR {DENSE_IOR} reflects more than the legacy 1.5 equivalent");
+        assert!(default_ior_shaded.abs_diff_eq(legacy_shaded, F0_TOLERANCE), "IOR 1.5 keeps the legacy reflectance: {default_ior_shaded}");
+    }
+
+    #[test]
+    fn specular_glossiness_shading_ignores_the_ior_specular_setting() {
+        let (off, on) = (ior_display(DENSE_IOR, false, true), ior_display(DENSE_IOR, true, true));
+        let render = |display: &DisplaySettings| {
+            let (scene, mut tracer) = (dielectric_scene(display), Tracer::new(24, 16));
+            for _ in 0..2 {
+                tracer.pass(&scene, &camera(), &TraceSettings::default());
+            }
+            tracer.rgba8(&TraceDisplay::from_display(display))
+        };
+
+        let (off_f0, on_f0) = (shaded_f0(&off), shaded_f0(&on));
+
+        assert_eq!(on_f0, off_f0, "the Specular color gives F0");
+        assert_eq!(render(&on), render(&off));
     }
 }

@@ -1,9 +1,9 @@
 //! Live bake preview: while the app bakes, the 3D view shows each mesh map on the model as soon
 //! as it is finished ([`crate::BakeTask::run_streaming`]). The streamed maps live here, not in
 //! the document: nothing enters the undo history until a texture set's bake is applied
-//! ([`Session::apply_streamed_bake`]). Cancellation leaves the current set unchanged; sets already
-//! applied keep their results and undo steps. The preview shows one map at a time, raw on the
-//! model; maps and texture sets not baked yet show their neutral value.
+//! ([`Session::apply_streamed_bake`]). The UI can apply eligible finished maps on cancellation.
+//! Already applied sets keep their results and undo steps. The preview shows one raw map at a time.
+//! Maps and texture sets that are still pending show their neutral value.
 
 mod preview_set;
 mod preview_show;
@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Bake preview",
         [],
         None,
-        "{show?: \"follow\" (the newest finished map) | \"material\" | \"map:<id>\" (pin a map)} → {active, show, shown, newest, stage, sets}. While the app bakes, the 3D view shows the maps as they finish; `show` picks what it shows. With no bake running {active: false} (setting `show` is then an error)",
+        "{show?: \"follow\" (the newest finished map) | \"material\" | \"map:<id>\" (pin a map)} → {active, show, shown, newest, stage, sets}. While the app bakes, the 3D view shows the maps as they finish; `show` picks what it shows. In Bake mode the app's map preview also shows here while Mesh Map Settings is in front. With neither {active: false} (setting `show` is then an error)",
         always,
         preview
     )]
@@ -82,16 +82,23 @@ impl Session {
     /// [`crate::BakeTask::maps`]. Invalid indices return the project's texture-set error before
     /// changing the preview or view mode. This reads settings without preparing bake geometry.
     pub fn bake_preview_begin_for(&mut self, sets: &[usize]) -> Result<()> {
-        let orders = sets
-            .iter()
-            .map(|&texture_set| {
-                let set = self.doc.project.texture_set(texture_set)?;
-                Ok((texture_set, set.bake.maps.enabled().collect()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+        let orders = self.bake_preview_orders(sets, None)?;
         self.bake_preview_begin(orders);
         Ok(())
+    }
+
+    /// Validate the entire selection before a bake takes the view or starts its first worker.
+    pub fn bake_preview_orders(&self, sets: &[usize], only: Option<BakedMap>) -> Result<Vec<(usize, Vec<BakedMap>)>> {
+        sets.iter()
+            .map(|&texture_set| {
+                let set = self.doc.project.texture_set(texture_set)?;
+                let maps = match only {
+                    Some(map) => vec![map],
+                    None => set.bake.maps.enabled().collect(),
+                };
+                Ok((texture_set, maps))
+            })
+            .collect()
     }
 
     /// Start showing a bake of `sets` (each with the maps it makes, in order): the 3D view
@@ -168,6 +175,9 @@ impl Session {
     pub fn bake_preview_end(&mut self) {
         if let Some(preview) = self.bake_preview.take() {
             self.view = preview.restore;
+
+            // The image behind a deferred "Other..." view may have been removed during the bake
+            self.drop_missing_image_view();
             self.revision = self.revision.wrapping_add(1);
         }
     }

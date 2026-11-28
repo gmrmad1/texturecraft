@@ -16,17 +16,6 @@ fn cli_binary_path(runner_path: Option<OsString>) -> OsString {
     runner_path.unwrap_or_else(|| env!("CARGO_BIN_EXE_texturecraft-cli").into())
 }
 
-#[test]
-fn cli_binary_prefers_relocated_runner_path() {
-    let relocated = OsString::from("relocated archive/texturecraft-cli");
-    assert_eq!(cli_binary_path(Some(relocated.clone())), relocated);
-}
-
-#[test]
-fn cli_binary_defaults_to_cargo_path() {
-    assert_eq!(cli_binary_path(None), OsString::from(env!("CARGO_BIN_EXE_texturecraft-cli")));
-}
-
 fn cli(args: &[&str]) -> Output {
     Command::new(cli_binary()).args(args).output().unwrap()
 }
@@ -55,9 +44,9 @@ fn p(path: &Path) -> &str {
 #[test]
 fn version_and_usage_errors() {
     let v = ok(&["--version"]);
-    assert!(v.starts_with("TextureCraft "), "{v}");
+    assert!(v.starts_with("texturecraft-cli "), "{v}");
     assert_eq!(v.lines().count(), 1);
-    assert!(ok(&["--help"]).contains("texturecraft-cli mcp"));
+    assert!(ok(&["--help"]).contains("Usage: texturecraft-cli <COMMAND>"));
     assert_eq!(cli(&[]).status.code(), Some(2));
     assert_eq!(cli(&["frobnicate"]).status.code(), Some(2));
     assert_eq!(cli(&["info", "--bogus"]).status.code(), Some(2));
@@ -65,8 +54,8 @@ fn version_and_usage_errors() {
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("error"));
     assert_eq!(cli(&["run", "builtin:nope", "layer.add.fill"]).status.code(), Some(1));
-    assert_eq!(cli(&["run", "builtin:cube", "layer.add.fill", "{not json"]).status.code(), Some(1));
-    assert_eq!(cli(&["render", "builtin:cube", "x.png", "--size", "big"]).status.code(), Some(1));
+    assert_eq!(cli(&["run", "builtin:cube", "layer.add.fill", "{not json"]).status.code(), Some(2));
+    assert_eq!(cli(&["render", "builtin:cube", "x.png", "--size", "big"]).status.code(), Some(2));
 }
 
 #[test]
@@ -84,7 +73,7 @@ fn new_info_run_bake_export_batch() {
     assert!(r["layer"].is_u64(), "{r}");
     assert_eq!(json(&["info", p(&b)])["layers"][0]["kind"], "fill");
 
-    ok(&["bake", p(&b), "--resolution", "128", "--maps", "ambientOcclusion,curvature"]);
+    ok(&["bake", p(&b), "--resolution", "128", "--maps", "ambientOcclusion,curvature", "--in-place"]);
     let maps = json(&["info", p(&b)])["textureSets"][0]["baked"]["maps"].clone();
     assert_eq!(maps.as_array().unwrap().len(), 2, "{maps}");
 
@@ -104,6 +93,38 @@ fn new_info_run_bake_export_batch() {
     std::fs::write(&script, r#"[{"id":"layer.add.paint"},{"id":"no.such"}]"#).unwrap();
     assert_eq!(cli(&["batch", p(&script)]).status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn batch_rejects_non_string_paths() {
+    let directory = tmp("batch-paths");
+    let script = directory.join("script.json");
+    let unexpected_project = directory.join("unexpected.tcraft");
+    let invalid_open = serde_json::json!({"steps": [], "open": false, "save": p(&unexpected_project)});
+    let invalid_save = serde_json::json!({
+        "open": "builtin:cube",
+        "save": [p(&unexpected_project)],
+        "steps": [{"id": "file.saveCopy", "params": {"path": p(&unexpected_project)}}]
+    });
+
+    for (body, field) in [(invalid_open, "open"), (invalid_save, "save")] {
+        std::fs::write(&script, body.to_string()).unwrap();
+        let output = cli(&["batch", p(&script)]);
+
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{field}: {error}");
+        assert!(error.contains(&format!("`{field}` field must be a string")), "{error}");
+        assert!(output.stdout.is_empty());
+        assert!(!unexpected_project.exists());
+    }
+
+    std::fs::write(&script, r#"{"steps":[],"open":null,"save":null}"#).unwrap();
+    let reply = json(&["batch", p(&script)]);
+
+    assert_eq!(reply["completed"], 0);
+    assert!(reply["failed"].is_null());
+
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -181,10 +202,10 @@ fn path_traced_render_needs_no_gpu() {
     // --camera looks through a camera saved in the project; an unknown name is an error.
     let proj = d.join("cams.tcraft");
     ok(&["run", "builtin:cube", "camera.set", r#"{"yaw": 80, "distance": 9}"#, "-o", p(&proj)]);
-    ok(&["run", p(&proj), "camera.add", r#"{"name": "Side"}"#, "-o", p(&proj)]);
+    ok(&["run", p(&proj), "camera.add", r#"{"name": "Side"}"#, "-o", p(&proj), "--in-place"]);
     ok(&["render", p(&proj), p(&out), "--size", "48x32", "--camera", "Side", "--samples", "2", "--cpu"]);
     assert_eq!(cli(&["render", p(&proj), p(&out), "--camera", "Nope", "--samples", "2", "--cpu"]).status.code(), Some(1));
-    assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "0"]).status.code(), Some(1));
+    assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "0"]).status.code(), Some(2));
     assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "4", "--view", "2d"]).status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&d);
 }

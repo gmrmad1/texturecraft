@@ -86,6 +86,63 @@ async fn inspect(c: &Conn) -> Value {
     tool(c, "session_inspect", json!({})).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn textures_export_accepts_per_map_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let (client, server) = connect(workspace(dir)).await;
+
+    let result = tool(
+        &client,
+        "textures_export",
+        json!({"dir": "textures", "preset": "glTF PBR Metal Roughness", "maps": [
+            {"map": 0, "format": "pgm", "bitDepth": 16, "size": 256},
+            {"map": 1, "enabled": false}
+        ]}),
+    )
+    .await;
+
+    let files = result["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{result}");
+    let graymap = files.iter().filter_map(Value::as_str).find(|path| path.ends_with(".pgm")).unwrap();
+    assert!(std::fs::read(dir.join(graymap)).unwrap().starts_with(b"P5\n256 256\n65535\n"));
+    let inherited = files.iter().filter_map(Value::as_str).find(|path| path.ends_with(".png")).unwrap();
+    assert_eq!(image::image_dimensions(dir.join(inherited)).unwrap(), (128, 128));
+
+    shutdown(client, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn textures_export_reports_the_shader_sidecar_and_write_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let (client, server) = connect(workspace(dir)).await;
+    let params = json!({"dir": "textures", "shaderParameters": [0]});
+
+    let result = tool(&client, "textures_export", params.clone()).await;
+
+    let files = result["files"].as_array().unwrap();
+    let sidecar = files.iter().filter_map(Value::as_str).find(|name| name.ends_with("_shaders.json")).expect("shader settings file");
+    let path = dir.join(sidecar);
+    let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(settings["shaders"][0]["textureSets"].as_array().unwrap().len(), 1);
+    assert!(settings["shaders"][0]["model"].is_string());
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let result = tool(&client, "textures_export", params).await;
+
+    assert!(result["warnings"].as_array().unwrap().iter().any(|warning| warning.as_str().is_some_and(|text| text.contains("shader settings file"))));
+    assert!(result["files"].as_array().unwrap().iter().any(|file| file.as_str().is_some_and(|name| name.ends_with(".png"))));
+
+    let error = tool_err(&client, "textures_export", json!({"dir": "invalid", "shaderParameters": [99]})).await;
+
+    assert!(error.contains("shaderParameters"));
+    assert!(!dir.join("invalid").exists());
+
+    shutdown(client, server).await;
+}
+
 fn top(s: &Value) -> &Value {
     &s["layers"][0]
 }
@@ -430,13 +487,15 @@ async fn mesh_files_export_bake_and_reimport_in_the_workspace() {
     assert!(!textures.is_empty() && textures.iter().all(|t| base.join(t.as_str().unwrap()).is_file()), "{usda}");
     assert_eq!(tool(&c, "mesh_export", json!({"path": "out/cube.glb"})).await["path"], "out/cube.glb");
     assert!(base.join("out/cube.usda").is_file() && base.join("out/cube.glb").is_file());
-    // The loose usda arrives packaged with its textures.
+
+    // The loose usda arrives packaged with its textures
     let high = tool(&c, "bake_mesh_add", json!({"path": "out/cube.usda"})).await;
     assert_eq!(high["name"], "cube.usdz", "{high}");
     let cage = tool(&c, "bake_mesh_add", json!({"path": "out/cube.glb", "cage": true})).await;
     assert_eq!(cage["meshes"]["cage"]["name"], "cube.glb", "{cage}");
     assert_eq!(inspect(&c).await["bakeMeshes"]["highPoly"][0]["name"], "cube.usdz");
-    // A built-in mesh has no file to re-read; a file does.
+
+    // A built-in mesh has no file to re-read; a file does
     assert!(tool_err(&c, "mesh_reimport", json!({})).await.contains("built-in"));
     tool(&c, "mesh_reimport", json!({"path": "out/cube.glb", "preserveStrokes": true})).await;
     assert_eq!(inspect(&c).await["mesh"]["source"], "mesh.glb");

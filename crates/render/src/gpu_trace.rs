@@ -51,6 +51,8 @@ struct Head {
 struct PostRaw {
     size: [u32; 4],
     display: [f32; 4],
+    back_top: [f32; 4],
+    back_bottom: [f32; 4],
 }
 
 struct Geometry {
@@ -92,8 +94,10 @@ struct SceneConst {
     eps: f32,
     sigma: Vec3,
     rotation: f32,
+    env_camera: bool,
     heights: Vec<f32>,
     ior: f32,
+    dielectric_f0_scale: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
     lens: [f32; 2],
 }
@@ -345,10 +349,11 @@ impl GpuTracer {
         };
         let same_geometry = self.geometry.as_ref().is_some_and(|g| Arc::ptr_eq(&g.mesh, &scene.mesh) && g.tri_set == scene.tri_set);
         if !same_geometry {
-            let nodes: Vec<(Vec3, Vec3, u32, u32)> = scene.bvh.nodes().collect();
-            if bvh_depth(&nodes).is_none_or(|d| d >= STACK) {
+            let depth = bvh_depth(&scene.bvh.nodes().collect::<Vec<_>>());
+            if depth.is_none_or(|depth| depth >= STACK) {
                 return Err("the mesh's BVH is too deep for GPU traversal".into());
             }
+
             let (data, verts) = geometry_data(&scene.mesh, &scene.bvh, &scene.tri_set);
             let (nodes, tris) = data;
             for (what, b) in [("BVH", nodes.len()), ("triangle list", tris.len()), ("vertex list", verts.len())] {
@@ -363,24 +368,23 @@ impl GpuTracer {
             })?);
             self.bind = None;
         }
+
         if !self.env.as_ref().is_some_and(|e| Arc::ptr_eq(&e.image, &scene.env)) {
             let img = &scene.env;
             let (w, h) = (img.width as usize, img.height as usize);
-            let valid = w > 0 && h > 0 && img.data.len() >= w * h && img.width.max(img.height) <= limits.max_texture_dimension_2d;
-            let (tw, th, rgba): (u32, u32, Vec<[f32; 4]>) =
-                if valid { (img.width, img.height, img.data.iter().take(w * h).map(|c| [c[0], c[1], c[2], 1.0]).collect()) } else { (1, 1, vec![[0.0; 4]]) };
-            let mut cdf = Vec::new();
-            if let Some(l) = scene.light.as_ref().filter(|l| valid && l.width == w && l.height == h) {
-                cdf.extend_from_slice(&l.rows);
-                cdf.extend_from_slice(&l.cols);
-                cdf.extend_from_slice(&l.prob);
-            }
-            fits("environment table", cdf.len() * 4)?;
-            let light = !cdf.is_empty();
-            if !light {
-                cdf.push(0.0);
-            }
+            let valid = w > 0 && h > 0 && img.width.max(img.height) <= limits.max_texture_dimension_2d && img.data.len() >= w * h;
+            let sampler = scene.light.as_ref().filter(|table| valid && table.width == w && table.height == h);
+
+            // The shader binds one zero when importance sampling is disabled
+            let parts = sampler.map_or([&[0.0][..], &[], &[]], |table| [table.rows.as_slice(), table.cols.as_slice(), table.prob.as_slice()]);
+            fits("environment table", parts.iter().map(|part| std::mem::size_of_val(*part)).sum())?;
+
             let env = scoped(device, "GPU path tracing: environment upload", || {
+                let (tw, th, rgba): (u32, u32, Vec<[f32; 4]>) = if valid {
+                    (img.width, img.height, img.data.iter().take(w * h).map(|c| [c[0], c[1], c[2], 1.0]).collect())
+                } else {
+                    (1, 1, vec![[0.0; 4]])
+                };
                 let tex = device.create_texture_with_data(
                     queue,
                     &wgpu::TextureDescriptor {
@@ -396,23 +400,28 @@ impl GpuTracer {
                     wgpu::util::TextureDataOrder::LayerMajor,
                     bytemuck::cast_slice(&rgba),
                 );
+                drop(rgba);
+
                 EnvGpu {
                     image: scene.env.clone(),
                     view: tex.create_view(&Default::default()),
-                    cdf: buffer(device, "tc_trace_cdf", bytemuck::cast_slice(&cdf)),
-                    light,
+                    cdf: buffer(device, "tc_trace_cdf", bytemuck::cast_slice(&parts.concat())),
+                    light: sampler.is_some(),
                 }
             })?;
             self.env = Some(env);
             self.bind = None;
         }
+
         self.scene = Some(SceneConst {
             spec_gloss: scene.spec_gloss,
             eps: scene.eps,
             sigma: scene.scatter_sigma,
             rotation: scene.env_rotation,
+            env_camera: scene.env_camera,
             heights: scene.sets.iter().map(|s| s.height_strength).collect(),
             ior: scene.ior,
+            dielectric_f0_scale: scene.dielectric_f0_scale,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
         });
         Ok(())
@@ -595,7 +604,7 @@ impl GpuTracer {
         });
         let (w, h) = (acc.width, acc.height);
         let inv_vp = cam.view_proj(w as f32 / h as f32).inverse();
-        let (sin, cos) = sc.rotation.sin_cos();
+        let (sin, cos) = (sc.rotation + if sc.env_camera { crate::renderer::camera_yaw(cam) } else { 0.0 }).sin_cos();
         let head = Head {
             inv_vp: inv_vp.to_cols_array(),
             forward: cam.forward().extend(sc.eps).to_array(),
@@ -604,7 +613,7 @@ impl GpuTracer {
             env: [sin, cos, 0.0, 0.0],
             sigma: sc.sigma.extend(0.0).to_array(),
             eye: cam.eye().extend(1.0).to_array(),
-            lens: [if sc.lens[0] > 0.0 { sc.lens[0] } else { cam.distance }, sc.lens[1], sc.ior, 0.0],
+            lens: [if sc.lens[0] > 0.0 { sc.lens[0] } else { cam.distance }, sc.lens[1], sc.ior, sc.dielectric_f0_scale],
         };
         let mut sets = [[0.0f32; 4]; 256];
         for (i, (slot, m)) in sets.iter_mut().zip(&mat.info).enumerate() {
@@ -637,14 +646,21 @@ impl GpuTracer {
         let disp = [display.exposure, flag(display.aces), display.env_opacity, flag(display.denoise)];
         let mut bytes = vec![0u8; self.post_stride as usize * STEPS.len()];
         for (i, step) in STEPS.iter().enumerate() {
-            let raw = PostRaw { size: [acc.width, acc.height, self.samples, *step], display: disp };
+            let [t, b] = display.background;
+            let raw = PostRaw {
+                size: [acc.width, acc.height, self.samples, *step],
+                display: disp,
+                back_top: [t[0], t[1], t[2], 0.0],
+                back_bottom: [b[0], b[1], b[2], 0.0],
+            };
             if let Some(slot) = bytes.get_mut(i * self.post_stride as usize..).and_then(|s| s.get_mut(..size_of::<PostRaw>())) {
                 slot.copy_from_slice(bytemuck::bytes_of(&raw));
             }
         }
         queue.write_buffer(&self.post, 0, &bytes);
         let post = wgpu::BufferBinding { buffer: &self.post, offset: 0, size: wgpu::BufferSize::new(size_of::<PostRaw>() as u64) };
-        // a: illum[0] → illum[1], b: illum[1] → illum[0].
+
+        // a: illum[0] → illum[1], b: illum[1] → illum[0]
         let group = |src: &wgpu::Buffer, dst: &wgpu::Buffer| {
             let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(post.clone()) }];
             entries.extend(acc.acc.iter().zip(1..).map(|(b, binding)| wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() }));
@@ -663,7 +679,7 @@ impl GpuTracer {
             cpass.dispatch_workgroups(groups.0, groups.1, 1);
         };
         if display.denoise {
-            // The five steps alternate b, a, b, a, b, leaving the result in illum[0].
+            // The five steps alternate b, a, b, a, b, leaving the result in illum[0]
             run(&self.init_pipe, &a, 0);
             for slot in 1..STEPS.len() {
                 run(&self.step_pipe, if slot % 2 == 1 { &b } else { &a }, slot);
@@ -920,8 +936,7 @@ mod tests {
 
     #[test]
     fn white_furnace_on_the_gpu_stays_bounded_and_finite() {
-        // White spheres in a uniform white environment reflect at most what arrives: at half
-        // exposure the environment shows as 0.5 and the spheres between 0.25 and 0.5.
+        // Half exposure puts the white environment at 0.5 and bounds the spheres below it
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let everything = [(CoatWeight, [1.0; 3]), (SheenWeight, [1.0; 3]), (AnisotropyLevel, [1.0; 3]), (ScatterWeight, [1.0; 3])];
@@ -929,7 +944,7 @@ mod tests {
             let values: Vec<_> = WHITE.iter().chain(extra).copied().collect();
             let env = EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] };
             let scene = sphere_scene(&mut h, env, &values);
-            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false };
+            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let (w, _, px) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &TraceSettings { bounces: 8 }, &d, [64, 48], 256).unwrap();
             assert!(accumulation(&h, &t).iter().all(|v| v.iter().all(|c| c.is_finite())), "{name}: no NaN or infinity");
             let at = |x: u32, y: u32| texturecraft_texel::srgb_to_linear(px[((y * w + x) * 4 + 1) as usize] as f32 / 255.0);
@@ -959,7 +974,7 @@ mod tests {
         for (name, values, lens) in [("every lobe", &values[..], None), ("glass under a thin lens", &glass[..], Some([3.2, 0.2]))] {
             let mut scene = sphere_scene(&mut h, crate::ibl::environment("Studio Contrast", 256), values);
             (scene.lens, scene.ior) = (lens, 1.45);
-            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let settings = TraceSettings { bounces: 6 };
             let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
             let mut cpu = Tracer::new(48, 36);
@@ -972,8 +987,7 @@ mod tests {
 
     #[test]
     fn gpu_reads_full_size_channels_beside_placeholders() {
-        // Base color stays at its default (a 1×1 placeholder texture) while roughness varies
-        // across the surface (a full-size texture): the tracer must still read every texel of it.
+        // A 1×1 base-color placeholder must not limit sampling of the full-size roughness map
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let mut composite = Composite::new(&[Roughness, Metallic], 64);
@@ -997,7 +1011,7 @@ mod tests {
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = crate::ibl::environment("Studio Contrast", 256);
         let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0);
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let settings = TraceSettings { bounces: 4 };
         let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
         let mut cpu = Tracer::new(48, 36);
@@ -1005,6 +1019,33 @@ mod tests {
             cpu.pass(&scene, &camera(), &settings);
         }
         assert_region_means_match("varying roughness, default base color", &gpu, &cpu.rgba8(&d), 48, 36, 3.0);
+    }
+
+    #[test]
+    fn gpu_matches_cpu_with_ior_specular_reflectance() {
+        use Channel::*;
+        let Some((mut h, mut t)) = gpu() else { return };
+
+        // A dark, glossy dielectric shows mostly its F0
+        let values = [(BaseColor, [0.02; 3]), (Metallic, [0.0; 3]), (Roughness, [0.15; 3]), (SpecularLevel, [1.0; 3])];
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
+        let settings = TraceSettings { bounces: 4 };
+        let mut sphere_brightness = Vec::new();
+
+        for ior_specular in [false, true] {
+            let display = texturecraft_core::DisplaySettings { ior: 1.8, ior_specular, ..Default::default() };
+            let mut scene = sphere_scene(&mut h, crate::ibl::environment("Studio Contrast", 256), &values);
+            (scene.ior, scene.dielectric_f0_scale) = (display.ior, display.dielectric_f0_scale());
+            let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
+            let mut cpu = Tracer::new(48, 36);
+            for _ in 0..1024 {
+                cpu.pass(&scene, &camera(), &settings);
+            }
+            assert_region_means_match(&format!("IOR specular {ior_specular}"), &gpu, &cpu.rgba8(&d), 48, 36, 3.0);
+            sphere_brightness.push(gpu.as_chunks::<4>().0.iter().map(|pixel| pixel[..3].iter().map(|v| u32::from(*v)).sum::<u32>()).sum::<u32>());
+        }
+
+        assert!(sphere_brightness[1] > sphere_brightness[0], "IOR 1.8 reflects more than the legacy F0: {sphere_brightness:?}");
     }
 
     /// Mean luminance of each 6×6 block of two RGBA8 renders agrees within `tol` 8-bit levels.
@@ -1041,7 +1082,8 @@ mod tests {
         let mut cam = OrbitCamera::default();
         cam.frame(lo, hi);
         let scene = TraceScene::new(mesh.clone(), Arc::new(Bvh::new(&mesh)), Vec::new(), Arc::new(crate::ibl::environment("Studio Soft", 1024)), 0.0);
-        let (settings, d) = (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true });
+        let (settings, d) =
+            (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true, background: crate::DEFAULT_BACKGROUND });
         let run = |t: &mut GpuTracer, n| t.render(&h.device, &h.queue, &h.renderer, &scene, &cam, &settings, &d, [1920, 1080], n).unwrap();
         run(&mut t, 8);
         let t0 = std::time::Instant::now();

@@ -32,6 +32,7 @@ fn sample() -> Sample {
         pixels,
         baked: [(0, baked)].into(),
         mesh: Some(("glb".into(), vec![1, 2, 3, 4, 5])),
+        mesh_uvs: None,
         high_poly: vec![("b_high.obj".into(), vec![7; 9]), ("a_high.ply".into(), vec![6])],
         cage: Some(("cage.obj".into(), vec![5, 5])),
         bake_paint: [((0, texturecraft_core::BakePaintTarget::Skew), BakePaintData { width: 3, height: 2, values: vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.125] })]
@@ -55,6 +56,7 @@ fn assert_same(a: &ProjectFile, b: &ProjectFile) {
     }
     assert_eq!(a.baked, b.baked);
     assert_eq!(a.mesh, b.mesh);
+    assert_eq!(a.mesh_uvs, b.mesh_uvs);
     assert_eq!((&a.high_poly, &a.cage), (&b.high_poly, &b.cage), "bake meshes keep their order");
     assert_eq!(a.bake_paint, b.bake_paint);
     assert_eq!(a.thumbnail, b.thumbnail);
@@ -83,6 +85,15 @@ fn round_trip_is_identical_and_deterministic() {
 }
 
 #[test]
+fn shared_project_schema_round_trips_the_app_document() {
+    let project = sample().pf.project;
+    let original = serde_json::to_value(&project).unwrap();
+    let document: craft_tcraft::ProjectDocument = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(document.format_version, project.format_version);
+    assert_eq!(serde_json::to_value(document).unwrap(), original);
+}
+
+#[test]
 fn legacy_bakes_load_as_is_without_layout_conversion() {
     let mut sample = sample();
     sample.pf.project.format_version = 1;
@@ -95,11 +106,65 @@ fn legacy_bakes_load_as_is_without_layout_conversion() {
     sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
 
     let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
-    assert_eq!(loaded.project.format_version, FORMAT_VERSION);
+    assert_eq!(loaded.project.format_version, TANGENT_BENT_NORMAL_VERSION);
     assert_eq!(loaded.baked, sample.pf.baked, "old bake pixels are accepted without preserving their former layout");
     assert_eq!(loaded.bake_paint, sample.pf.bake_paint, "correction paint remains in the working layout");
     let reopened = load_project_bytes(&save_project_bytes(&loaded).unwrap()).unwrap();
     assert_same(&loaded, &reopened);
+}
+
+#[test]
+fn a_bent_normal_declared_without_pixels_in_an_older_project_is_dropped_and_reported() {
+    let mut sample = sample();
+    sample.pf.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
+    assert!(!sample.pf.baked[&0].maps.contains_key(&BakedMap::BentNormal));
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(!older.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\""), "{}", older.warnings[0]);
+}
+
+#[test]
+fn a_bent_normal_with_pixels_but_no_declaration_in_an_older_project_is_dropped_and_reported() {
+    let mut sample = sample();
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
+    assert!(!sample.pf.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(!older.baked[&0].maps.contains_key(&BakedMap::BentNormal));
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\""), "{}", older.warnings[0]);
+}
+
+#[test]
+fn world_space_bent_normals_of_older_projects_are_dropped_for_a_rebake() {
+    let mut sample = sample();
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
+    sample.pf.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
+
+    // A current project keeps its tangent-space bent normals
+    let current = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(current.warnings.is_empty(), "{:?}", current.warnings);
+    assert_same(&sample.pf, &current);
+
+    // One saved before tangent space held world vectors: they go, the other maps stay
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\"") && older.warnings[0].contains("Bent Normals"), "{}", older.warnings[0]);
+    let maps = &older.baked[&0].maps;
+    assert!(!maps.contains_key(&BakedMap::BentNormal));
+    assert!(maps.contains_key(&BakedMap::AmbientOcclusion) && maps.contains_key(&BakedMap::Normal));
+    assert!(!older.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    assert_eq!(older.project.texture_sets[0].bake, sample.pf.project.texture_sets[0].bake, "the bake settings stay for the re-bake");
+
+    // Saved again, the project is current and opens without the warning
+    let reopened = load_project_bytes(&save_project_bytes(&older).unwrap()).unwrap();
+    assert!(reopened.warnings.is_empty(), "{:?}", reopened.warnings);
+    assert_same(&older, &reopened);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -803,13 +868,17 @@ fn baked_dimensions_must_match_the_entry_before_reserving_payload_bytes() {
 #[test]
 fn streamed_float_chunks_preserve_bits_across_the_chunk_boundary() {
     let values: Vec<u32> = (0..BAKED_CHUNK + 3).map(|index| (index as u32).wrapping_mul(0x9e3779b9)).collect();
-    let bytes: Vec<u8> = values.iter().flat_map(|bits| bits.to_le_bytes()).collect();
+    let mut bytes = header(values.len() as u32, 1, 1, 0);
+    bytes.extend(values.iter().flat_map(|bits| bits.to_le_bytes()));
+    let declared = bytes.len() as u64;
     let mut reader = Cursor::new(bytes);
+    let mut budget = LoadBudget::new(declared);
 
-    let decoded = read_f32s(&mut reader, values.len(), "baked map").unwrap();
+    let (_, _, decoded) = read_baked(&mut reader, declared, 1, &mut budget, "baked map").unwrap();
 
     assert_eq!(decoded.into_iter().map(f32::to_bits).collect::<Vec<_>>(), values);
-    assert_eq!(reader.position(), (values.len() * 4) as u64);
+    assert_eq!(reader.position(), declared);
+    assert_eq!(budget.remaining(), 0);
 }
 
 #[test]
@@ -818,23 +887,19 @@ fn archive_indexing_does_not_scan_large_payloads_and_rejects_large_metadata() {
     writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
     writer.write_all(&vec![7; 1 << 20]).unwrap();
     let bytes = writer.finish().unwrap().into_inner();
-    let metadata_only = Cell::new(true);
 
-    let mut archive = open_archive(Cursor::new(bytes), &metadata_only, 4096).unwrap();
+    let mut archive = open_archive(Cursor::new(bytes), 4096).unwrap();
     let mut first_byte = [0; 1];
     archive.by_index(0).unwrap().read_exact(&mut first_byte).unwrap();
 
     assert_eq!(first_byte, [7]);
-    assert!(!metadata_only.get());
 
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     writer.start_file("a".repeat(5000), SimpleFileOptions::default()).unwrap();
     writer.write_all(&[7]).unwrap();
     let bytes = writer.finish().unwrap().into_inner();
-    let metadata_only = Cell::new(true);
 
-    assert!(open_archive(Cursor::new(bytes), &metadata_only, 4096).is_err());
-    assert!(metadata_only.get(), "failed indexing must not enable payload access");
+    assert!(open_archive(Cursor::new(bytes), 4096).is_err());
 }
 
 #[test]
@@ -845,9 +910,8 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
             writer.start_file(format!("e{index}"), SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
         }
         let bytes = writer.finish().unwrap().into_inner();
-        let metadata_only = Cell::new(true);
 
-        let mut archive = open_archive(Cursor::new(bytes), &metadata_only, MAX_ZIP_METADATA_BYTES).unwrap();
+        let mut archive = open_archive(Cursor::new(bytes), MAX_ZIP_METADATA_BYTES).unwrap();
         let result = check_archive(&mut archive, 0);
 
         assert_eq!(archive.len(), count);
@@ -856,5 +920,87 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
         } else {
             assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
         }
+    }
+}
+
+fn rebuilt_uvs_sample() -> ProjectFile {
+    let mut project_file = sample().pf;
+    project_file.project.mesh_rebuild_uvs = true;
+    project_file.mesh_uvs = Some(vec![Vec2::new(0.25, 0.75), Vec2::new(1.0, 0.0), Vec2::new(0.5, 0.125)]);
+    project_file
+}
+
+#[test]
+fn a_saved_uv_layout_round_trips_in_format_4() {
+    const ADDITIONAL_CORNERS: usize = 3000;
+
+    let mut project_file = rebuilt_uvs_sample();
+    let layout = project_file.mesh_uvs.as_mut().unwrap();
+
+    // Exercise full batches and a partial final batch with distinct UVs
+    layout.extend((0..ADDITIONAL_CORNERS).map(|corner| Vec2::new(corner as f32 / ADDITIONAL_CORNERS as f32, 0.5)));
+
+    let loaded = load_project_bytes(&save_project_bytes(&project_file).unwrap()).unwrap();
+
+    assert_eq!(loaded.mesh_uvs, project_file.mesh_uvs);
+    assert_eq!(loaded.project.format_version, REBUILT_MESH_UVS_VERSION);
+}
+
+#[test]
+fn a_saved_uv_layout_requires_format_4_and_the_rebuild_setting() {
+    let project_file = rebuilt_uvs_sample();
+    let older_version = edit_project_json(&project_file, |json| json["format_version"] = TANGENT_BENT_NORMAL_VERSION.into());
+    let disabled_rebuild = edit_project_json(&project_file, |json| json["mesh_rebuild_uvs"] = false.into());
+
+    for archive in [older_version, disabled_rebuild] {
+        let error = load_project_bytes(&archive).map(|_| ()).expect_err("the archive has inconsistent UV layout metadata");
+
+        assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+    }
+}
+
+#[test]
+fn a_rebuilt_project_cannot_be_saved_without_its_layout() {
+    let mut project_file = rebuilt_uvs_sample();
+    project_file.mesh_uvs = None;
+
+    let error = save_project_bytes(&project_file).map(|_| ()).expect_err("the snapshot is missing the rebuilt UV layout");
+
+    assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+}
+
+#[test]
+fn rebuilt_uvs_without_a_valid_saved_layout_are_refused() {
+    let project_file = rebuilt_uvs_sample();
+    let without_layout = edit_archive(&project_file, |name, _| {
+        if name == UV_LAYOUT_ENTRY {
+            *name = "ignored.bin".into();
+        }
+    });
+    let edited_layout = |edit: fn(&mut Vec<u8>)| {
+        edit_archive(&project_file, |name, data| {
+            if name == UV_LAYOUT_ENTRY {
+                edit(data);
+            }
+        })
+    };
+    let truncated = edited_layout(|data| data.truncate(data.len() - 1));
+    let trailing_bytes = edited_layout(|data| data.push(0));
+    let short_header = edited_layout(|data| data.truncate(8));
+    let wrong_count = edited_layout(|data| data[8] = 9);
+    let non_finite = edited_layout(|data| data[12..16].copy_from_slice(&f32::NAN.to_le_bytes()));
+    let bad_magic = edited_layout(|data| data[0] = b'X');
+
+    for (case, bytes) in [
+        ("missing", without_layout),
+        ("truncated", truncated),
+        ("trailing bytes", trailing_bytes),
+        ("short header", short_header),
+        ("wrong count", wrong_count),
+        ("non-finite", non_finite),
+        ("bad magic", bad_magic),
+    ] {
+        let error = load_project_bytes(&bytes).unwrap_err();
+        assert!(!is_guard_error(&error), "{case}: {error}");
     }
 }

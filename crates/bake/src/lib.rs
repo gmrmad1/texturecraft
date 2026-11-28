@@ -5,19 +5,27 @@
 
 mod bake_error;
 mod bake_output;
+mod bake_passes;
 mod bake_request;
 mod cage;
 mod high_poly;
 mod mesh_extent;
+mod name_pair;
 mod progress;
+mod region_bake;
+mod texel_box;
 
 pub use bake_error::BakeError;
 pub use bake_output::BakeOutput;
+pub use bake_passes::BakePasses;
 pub use bake_request::BakeRequest;
 pub use cage::{CageShell, HighPolyReach, RayStart, VertexReach};
 pub use high_poly::HighPoly;
 pub(crate) use mesh_extent::MeshExtent;
+pub use name_pair::NamePair;
 pub use progress::Progress;
+pub use region_bake::{RegionBake, region_keeps_pixels};
+pub use texel_box::TexelBox;
 
 mod map;
 mod skew;
@@ -46,6 +54,8 @@ const STRIP_TEXELS: usize = 1 << 24;
 const BATCH: usize = 1 << 18;
 // Curvature batches stay small so progress and cancellation remain responsive
 const CURVATURE_BATCH: usize = 1 << 15;
+/// Smallest mesh extent the maps are normalized by, so a flat mesh never divides by zero
+const MIN_MESH_EXTENT: f32 = 1e-6;
 
 fn validate(request: &BakeRequest) -> Result<(), BakeError> {
     let settings = request.settings;
@@ -147,7 +157,7 @@ fn alloc<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
 }
 
 pub fn bake(request: &BakeRequest, progress: &Progress) -> Result<BakeOutput, BakeError> {
-    bake_in_strips(request, progress, STRIP_TEXELS, &CpuTracer, &[])
+    bake_tiles(request, progress, &[], None)
 }
 
 /// Retry on the CPU if the supplied tracer fails
@@ -157,29 +167,45 @@ pub fn bake_on(request: &BakeRequest, progress: &Progress, tracer: &dyn Tracer) 
 
 /// Excluded atlas blocks produce no samples; their geometry still participates in ray tracing
 pub fn bake_tiles(request: &BakeRequest, progress: &Progress, excluded_tiles: &[(u32, u32)], tracer: Option<&dyn Tracer>) -> Result<BakeOutput, BakeError> {
-    let tracer = tracer.unwrap_or(&CpuTracer);
-    match bake_in_strips(request, progress, STRIP_TEXELS, tracer, excluded_tiles) {
-        Err(BakeError::Tracer(error)) => {
-            let mut output = bake_in_strips(request, progress, STRIP_TEXELS, &CpuTracer, excluded_tiles)?;
-            output.tracer = format!("CPU ({} unavailable: {error})", tracer.name());
-            Ok(output)
-        }
-        result => result,
-    }
+    bake_tiles_in(request, progress, excluded_tiles, None, tracer)
+}
+
+/// [`bake_tiles`] sampling only `region`'s texels and padding a whole map; equal to a whole bake for [`region_keeps_pixels`] maps
+pub fn bake_tiles_in(
+    request: &BakeRequest,
+    progress: &Progress,
+    excluded_tiles: &[(u32, u32)],
+    region: Option<RegionBake>,
+    tracer: Option<&dyn Tracer>,
+) -> Result<BakeOutput, BakeError> {
+    BakePasses::new(*request).run(request.settings, progress, excluded_tiles, region, tracer, STRIP_TEXELS)
 }
 
 type OutRow<'a> = Vec<&'a mut [f32]>;
 
+#[cfg(test)]
 fn bake_in_strips(
     request: &BakeRequest,
     progress: &Progress,
     strip_texels: usize,
     tracer: &dyn Tracer,
     excluded_tiles: &[(u32, u32)],
+    region: Option<RegionBake>,
 ) -> Result<BakeOutput, BakeError> {
-    validate(request)?;
-    if excluded_tiles.iter().any(|(column, row)| *column >= request.tiles.0 || *row >= request.tiles.1) {
-        return Err(BakeError::Invalid("excluded UV tile lies outside the bake atlas".into()));
+    BakePasses::new(*request).run(request.settings, progress, excluded_tiles, region, Some(tracer), strip_texels)
+}
+
+fn bake_prepared(
+    request: &BakeRequest,
+    context: &map::BakeContext,
+    progress: &Progress,
+    strip_texels: usize,
+    tracer: &dyn Tracer,
+    excluded_tiles: &[(u32, u32)],
+    region: Option<RegionBake>,
+) -> Result<BakeOutput, BakeError> {
+    if progress.cancel.load(Relaxed) {
+        return Err(BakeError::Cancelled);
     }
 
     let settings = request.settings;
@@ -187,7 +213,6 @@ fn bake_in_strips(
     let tile_size = (tile_width as usize, tile_height as usize);
     let samples_per_axis = settings.common.antialiasing.samples_per_axis() as usize;
     let (width, height) = (tile_size.0 * request.tiles.0 as usize, tile_size.1 * request.tiles.1 as usize);
-    let context = map::BakeContext::new(request)?;
     let tracer = if context.casts_rays() { tracer } else { &CpuTracer };
     let meshes = context.trace_meshes();
     let mut scene = tracer.scene(&meshes)?;
@@ -205,7 +230,7 @@ fn bake_in_strips(
     let mut padding_map = None;
     let total_rows = height.max(1) as u64;
     let mut rows_done = 0u64;
-    let strip_error = || BakeError::Invalid("strip output of range".into());
+    let strip_error = || BakeError::Invalid("strip output out of range".into());
 
     let (sample_width, sample_height) = (width * samples_per_axis, height * samples_per_axis);
     let rows_per_strip = (strip_texels / (sample_width * samples_per_axis)).max(1).min(height);
@@ -244,6 +269,16 @@ fn bake_in_strips(
             }
         });
 
+        // Coverage stays the whole map's, so padding matches a whole bake; only the region is sampled
+        if let Some(region) = region {
+            for (row_index, row) in gbuffer.tri.chunks_mut(sample_width).enumerate() {
+                let y = (sample_start_y + row_index) / samples_per_axis;
+                for outside in region.texels.outside_row(y, samples_per_axis, row.len()) {
+                    row.get_mut(outside).unwrap_or_default().fill(NO_TRI);
+                }
+            }
+        }
+
         let mut output_rows: Vec<OutRow> = (0..rows).map(|_| Vec::with_capacity(maps.len())).collect();
         for (map, data) in maps.iter().zip(buffers.iter_mut()) {
             let component_count = map.components();
@@ -252,14 +287,16 @@ fn bake_in_strips(
                 row.push(chunk);
             }
         }
+
         let mut bake_strip = || {
             for (batch_index, batch) in output_rows.chunks_mut(rows_per_batch).enumerate() {
                 if progress.cancel.load(Relaxed) {
                     return Err(BakeError::Cancelled);
                 }
+
                 // Global sample indices keep noise unchanged across strip and batch sizes
                 bake_rows(
-                    &context,
+                    context,
                     &maps,
                     request.mesh,
                     &gbuffer,
@@ -269,10 +306,11 @@ fn bake_in_strips(
                     (width, samples_per_axis, sample_start_y * sample_width),
                 )?;
                 rows_done += batch.len() as u64;
-                progress.done.store((rows_done.saturating_mul(10_000) / total_rows).min(10_000) as u32, Relaxed);
+                progress.done.store((rows_done.saturating_mul(u64::from(Progress::DONE)) / total_rows).min(u64::from(Progress::DONE)) as u32, Relaxed);
             }
             Ok(())
         };
+
         if strip_start + rows < height || (settings.common.dilation == 0 && !settings.common.apply_diffusion) {
             bake_strip()?;
         } else {
@@ -281,6 +319,22 @@ fn bake_in_strips(
             let (padding, baked) = rayon::join(padding, bake_strip);
             baked?;
             padding_map = Some(padding);
+        }
+    }
+
+    if let Some(region) = region {
+        for (map, pixels) in maps.iter().zip(buffers.iter_mut()) {
+            let previous = region.previous.get(map).filter(|previous| previous.len() == pixels.len());
+            let previous = previous.ok_or_else(|| BakeError::Invalid(format!("no whole {} map of this size to bake a region of", map.id())))?;
+            let components = map.components();
+            let row_len = (width * components).max(1);
+            for (y, (row, kept)) in pixels.chunks_exact_mut(row_len).zip(previous.chunks_exact(row_len)).enumerate() {
+                for outside in region.texels.outside_row(y, components, row_len) {
+                    if let (Some(row), Some(kept)) = (row.get_mut(outside.clone()), kept.get(outside)) {
+                        row.copy_from_slice(kept);
+                    }
+                }
+            }
         }
     }
 
@@ -299,7 +353,8 @@ fn bake_in_strips(
     }
 
     let (bounds_min, bounds_max) = request.mesh.bounds();
-    map::normalize(&mut output, &covered, width, tile_size, settings, (bounds_max - bounds_min).max_element().max(1e-6));
+    map::normalize(&mut output, &covered, width, tile_size, settings, (bounds_max - bounds_min).max_element().max(MIN_MESH_EXTENT));
+
     if let Some(padding_map) = padding_map {
         for (map, data) in output.iter_mut() {
             padding_map.apply(data, map.components());
@@ -308,10 +363,12 @@ fn bake_in_strips(
             }
         }
     }
+
     if progress.cancel.load(Relaxed) {
         return Err(BakeError::Cancelled);
     }
-    progress.done.store(10_000, Relaxed);
+
+    progress.done.store(Progress::DONE, Relaxed);
     Ok(BakeOutput { resolution: width as u32, height: height as u32, maps: output, tracer: tracer.name() })
 }
 
@@ -347,6 +404,7 @@ fn bake_rows(
                 .collect()
         })
         .collect();
+
     let row_offsets: Vec<usize> = samples_by_row
         .iter()
         .scan(0, |sample_count, row| {
@@ -360,11 +418,12 @@ fn bake_rows(
         true => {
             let (rays, frontal_distances): (Vec<tracing::Ray>, Vec<f32>) = samples().map(|sample| context.transfer_ray(&sample.surface, sample.bary)).unzip();
             let hits = scene.closest(1, &rays, context.ignore_transfer_backface())?;
-            hits.into_par_iter().zip(frontal_distances).map(|(hit, front)| context.transfer(hit, front)).collect()
+            hits.into_par_iter().zip(&rays).zip(frontal_distances).map(|((hit, ray), front)| context.transfer(hit, front, ray.max_distance)).collect()
         }
         false => Vec::new(),
     };
     let transfer = |sample_index: usize| transfers.get(sample_index).and_then(Option::as_ref);
+
     let curvature = match context.traces_curvature() {
         true => {
             let items: Vec<(&Surface, Option<&map::Transfer>)> = samples_by_row
@@ -377,6 +436,7 @@ fn bake_rows(
         }
         false => Vec::new(),
     };
+
     let queries: Vec<tracing::Query> = match context.ao.is_some() || context.bent.is_some() || context.thickness.is_some() {
         true => samples_by_row
             .par_iter()
@@ -386,6 +446,7 @@ fn bake_rows(
             .collect(),
         false => Vec::new(),
     };
+
     // Share occlusion results when the bent-normal ray settings match
     let separate_bent_pass = context.bent.filter(|_| context.bent != context.ao);
     let passes: Vec<tracing::Hemisphere> = [context.ao, separate_bent_pass, context.thickness].into_iter().flatten().collect();
